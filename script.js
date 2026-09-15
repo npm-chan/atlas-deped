@@ -4,6 +4,8 @@
 
 const GRADE_ORDER = ["Grade 7","Grade 8","Grade 9","Grade 10","Grade 11","Grade 12"];
 
+document.documentElement.classList.add("auth-checking");
+
 // DepEd Key Stage groupings: JHS (Grades 7–10) falls under Key Stage 3 of the
 // MATATAG Curriculum; SHS (11–12) continues under the 2016 SHS Curriculum.
 function keyStageOf(grade){
@@ -3686,7 +3688,6 @@ document.getElementById("sidebarBackdrop").addEventListener("click", closeMobile
 document.getElementById("navlist").addEventListener("click", e=>{
   const btn = e.target.closest("button"); if(!btn) return;
   navigateTo(btn.dataset.page);
-  closeMobileSidebar();
 });
 
 let lastScrollY = window.scrollY;
@@ -3733,7 +3734,6 @@ const QUICK_ACTIONS = [
   { id:"bell_schedule", icon:"🕒", label:"Bell Schedule", page:"settings", roles:["super_admin","admin"] },
   { id:"validate_schedule", icon:"✓", label:"Validate Schedule", page:"schedule", open:()=>document.getElementById("validateScheduleBtn")?.click(), roles:["super_admin","admin"] },
   { id:"view_final_schedule", icon:"📅", label:"Final Classroom Schedule", page:"finalschedule", roles:["super_admin","admin","teacher"] },
-  { id:"resolve_conflicts", icon:"⚠️", label:"Schedule Conflicts", page:"conflicts", roles:["super_admin","admin"] },
   { id:"view_reports", icon:"📊", label:"View Reports", page:"reports", roles:["super_admin","admin","teacher"] },
   { id:"admin_settings", icon:"⚙️", label:"Admin Settings", page:"settings", roles:["super_admin","admin"] }
 ];
@@ -6766,15 +6766,13 @@ function showPendingView(){
   document.getElementById("authView-pending").style.display = "block";
   document.getElementById("authView-verify").style.display = "none";
 }
-function showVerifyView(fbUser){
+function showEmailVerificationView(){
   document.querySelectorAll(".auth-tab").forEach(b=> b.classList.remove("active"));
   document.getElementById("authView-login").style.display = "none";
   document.getElementById("authView-signup").style.display = "none";
   document.getElementById("authView-forgot").style.display = "none";
   document.getElementById("authView-pending").style.display = "none";
   document.getElementById("authView-verify").style.display = "block";
-  document.getElementById("verifyEmailLabel").textContent = fbUser.email || "your email address";
-  document.getElementById("verifyErr").textContent = "";
 }
 document.querySelectorAll(".auth-tab").forEach(b=> b.addEventListener("click", ()=> switchAuthTab(b.dataset.authTab)));
 document.getElementById("gotoSignup").addEventListener("click", e=>{ e.preventDefault(); switchAuthTab("signup"); });
@@ -6789,6 +6787,28 @@ document.querySelectorAll("[data-toggle-pw]").forEach(btn=>{
     btn.textContent = showing ? "Show" : "Hide";
   });
 });
+document.getElementById("verifyLogoutBtn").addEventListener("click", e=>{ e.preventDefault(); firebase.auth().signOut(); });
+document.getElementById("verifyRefreshBtn").addEventListener("click", async ()=>{
+  const user = firebase.auth().currentUser;
+  if(!user) return;
+  await user.reload();
+  if(user.emailVerified) location.reload();
+  else document.getElementById("verifyErr").textContent = "Your email is not verified yet. Open the link in your email, then try again.";
+});
+document.getElementById("verifyResendBtn").addEventListener("click", async ()=>{
+  const user = firebase.auth().currentUser;
+  const err = document.getElementById("verifyErr");
+  if(!user) return;
+  try{
+    await user.sendEmailVerification();
+    document.getElementById("verifyBanner").style.display = "inline-block";
+    document.getElementById("verifyBanner").textContent = "A new verification link was sent. You can request another after 3 minutes.";
+    document.getElementById("verifyResendBtn").disabled = true;
+    setTimeout(()=>document.getElementById("verifyResendBtn").disabled = false, 180000);
+  }catch(e){ err.textContent = "Could not resend the verification link: "+e.message; }
+});
+
+firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(error=>console.warn("ATLAS could not enable persistent login:", error));
 
 // Called by firebase.auth().onAuthStateChanged whenever a real Firebase
 // user is signed in. Loads (or, on first sign-in, creates) that user's
@@ -6831,11 +6851,11 @@ async function handleAuthenticatedUser(fbUser){
   }
   AUTH_SESSION = { id: fbUser.uid, uid: fbUser.uid, name: profile.name, email: profile.email, role: profile.role };
 
-  const usesEmailPassword = fbUser.providerData.some(provider=>provider.providerId === "password");
+  const usesEmailPassword = fbUser.providerData.some(p=>p.providerId==="password");
   if(usesEmailPassword && !fbUser.emailVerified){
     document.getElementById("authScreen").style.display = "flex";
     document.getElementById("appRoot").classList.remove("authed");
-    showVerifyView(fbUser);
+    showEmailVerificationView();
     return;
   }
 
@@ -6872,12 +6892,6 @@ async function handleAuthenticatedUser(fbUser){
   if(WELCOME_TOAST_MESSAGE){ showToast(WELCOME_TOAST_MESSAGE); WELCOME_TOAST_MESSAGE = null; }
 }
 
-// Keep the Firebase session across refreshes and browser restarts. The user
-// still controls the session with the explicit Log Out action.
-firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(error=>{
-  console.warn("Could not enable persistent Firebase session:", error);
-});
-
 firebase.auth().onAuthStateChanged(async (fbUser)=>{
   try{
     if(fbUser){
@@ -6892,6 +6906,8 @@ firebase.auth().onAuthStateChanged(async (fbUser)=>{
     console.error("onAuthStateChanged handler failed:", e);
     document.getElementById("authScreen").style.display = "flex";
     document.getElementById("appRoot").classList.remove("authed");
+  }finally{
+    document.documentElement.classList.remove("auth-checking");
   }
 });
 
@@ -6937,11 +6953,10 @@ document.getElementById("signupBtn").addEventListener("click", async ()=>{
   try{
     const cred = await firebase.auth().createUserWithEmailAndPassword(email, password);
     await cred.user.updateProfile({ displayName: name });
-    const nowIso = new Date().toISOString();
-    const verificationProfile = { name, email, role:"pending", accountType:"email", createdAt: nowIso, updatedAt: nowIso, verificationLastSentAt:nowIso, verificationAttempts:0 };
-    await createUserProfileDoc(cred.user.uid, verificationProfile);
     await cred.user.sendEmailVerification();
-    WELCOME_TOAST_MESSAGE = `Account created. A verification link was sent to ${email}.`;
+    const nowIso = new Date().toISOString();
+    await createUserProfileDoc(cred.user.uid, { name, email, role:"pending", accountType:"email", verificationSentAt: nowIso, createdAt: nowIso, updatedAt: nowIso });
+    WELCOME_TOAST_MESSAGE = `Account created. Check ${email} to verify it.`;
   }catch(e){
     if(e.code==="auth/email-already-in-use"){ errEl.textContent = "An account with that email already exists. Try logging in instead."; setFieldError("signupEmail", true); }
     else if(e.code==="auth/weak-password"){ errEl.textContent = "Password is too weak. Please choose a stronger password."; setFieldError("signupPassword", true); }
@@ -7003,51 +7018,6 @@ async function handleGoogleSignIn(){
 });
 
 document.getElementById("pendingLogoutBtn").addEventListener("click", ()=> firebase.auth().signOut());
-document.getElementById("verifyLogoutBtn").addEventListener("click", ()=> firebase.auth().signOut());
-
-const VERIFY_DELAYS_MS = [3*60*1000, 5*60*1000, 10*60*1000, 15*60*1000, 30*60*1000, 10*60*60*1000];
-let VERIFY_USER = null;
-function verificationCooldown(profile){
-  const attempts = Math.max(0, Number(profile && profile.verificationAttempts) || 0);
-  const sentAt = Date.parse(profile && profile.verificationLastSentAt || "") || 0;
-  const wait = VERIFY_DELAYS_MS[Math.min(attempts, VERIFY_DELAYS_MS.length-1)] || VERIFY_DELAYS_MS[VERIFY_DELAYS_MS.length-1];
-  return Math.max(0, sentAt + wait - Date.now());
-}
-async function sendVerificationLink(user, profile, force){
-  const remaining = force ? 0 : verificationCooldown(profile);
-  if(remaining>0) throw new Error("Please wait "+Math.ceil(remaining/60000)+" minute(s) before requesting another verification link.");
-  await user.sendEmailVerification();
-  const next = {
-    verificationLastSentAt:new Date().toISOString(),
-    verificationAttempts:(Number(profile && profile.verificationAttempts)||0)+1,
-    updatedAt:new Date().toISOString()
-  };
-  await createUserProfileDoc(user.uid, next);
-  return next;
-}
-document.getElementById("refreshVerifyBtn").addEventListener("click", async ()=>{
-  const btn = document.getElementById("refreshVerifyBtn");
-  btn.disabled = true;
-  try{
-    await firebase.auth().currentUser.reload();
-    if(firebase.auth().currentUser.emailVerified){
-      await handleAuthenticatedUser(firebase.auth().currentUser);
-    }else{
-      document.getElementById("verifyErr").textContent = "Your email is not verified yet. Open the link from your email, then try again.";
-    }
-  }catch(e){ document.getElementById("verifyErr").textContent = e.message || "Could not refresh verification status."; }
-  finally{ btn.disabled = false; }
-});
-document.getElementById("resendVerifyBtn").addEventListener("click", async ()=>{
-  const btn = document.getElementById("resendVerifyBtn");
-  btn.disabled = true;
-  try{
-    const profile = await getUserProfileDoc(firebase.auth().currentUser.uid) || {};
-    await sendVerificationLink(firebase.auth().currentUser, profile, false);
-    document.getElementById("verifyErr").textContent = "A new verification link was sent. Please check your inbox.";
-  }catch(e){ document.getElementById("verifyErr").textContent = e.message || "Could not send a verification link."; }
-  finally{ btn.disabled = false; }
-});
 
 document.getElementById("logoutBtn").addEventListener("click", ()=>{
   openConfirm("Log out of ATLAS?", async ()=>{
@@ -7092,7 +7062,7 @@ function updateInstallButton(){
   const button = document.getElementById("installAppBtn");
   if(!button) return;
   button.style.display = isAtlasInstalled() ? "none" : "inline-flex";
-  button.disabled = !deferredInstallPrompt;
+  button.disabled = false;
   button.title = deferredInstallPrompt ? "Install ATLAS on this device" : "Install is available from a supported browser over HTTPS or localhost";
 }
 
@@ -7417,7 +7387,7 @@ const ATLASTour = (function(){
       </div>`;
     const close = ()=>{ r.innerHTML = ""; };
     document.getElementById("tourDoneFinish").onclick = ()=>{ close(); maybeOfferInstallPrompt(); };
-    document.getElementById("tourDoneRestartLater").onclick = close;
+    document.getElementById("tourDoneRestartLater").onclick = ()=>{ close(); maybeOfferInstallPrompt(); };
   }
 
   function showWelcome(){
@@ -7464,7 +7434,10 @@ const ATLASTour = (function(){
     else maybeOfferInstallPrompt();
   }
 
-  function maybeOfferInstallPrompt(){ window.maybeOfferInstallPrompt(); }
+  async function maybeOfferInstallPrompt(){
+    const state = await loadTourState();
+    if(state && (state.status === "completed" || state.status === "skipped")) window.maybeOfferInstallPrompt();
+  }
 
   return { startTour, nextStep, previousStep, skipTour, finishTour, restartTour, showStep, saveTourState, loadTourState, maybeOfferOnLogin, maybeOfferInstallPrompt };
 })();
