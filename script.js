@@ -7029,6 +7029,7 @@ document.getElementById("logoutBtn").addEventListener("click", ()=>{
     }else{
       showToast("You are offline. Local data was saved; cloud backup will happen after you reconnect and log in.", true);
     }
+    if(typeof ATLASTour !== "undefined") await ATLASTour.resetDeferredOnLogout();
     await firebase.auth().signOut();
     switchAuthTab("login");
     document.getElementById("loginEmail").value = "";
@@ -7227,6 +7228,19 @@ const ATLASTour = (function(){
     }catch(e){ console.error("ATLASTour: could not save tour state:", e); }
   }
 
+  async function resetDeferredOnLogout(){
+    const email = currentEmail();
+    if(!email) return;
+    try{
+      const raw = await Store.get(TOUR_STATE_KEY);
+      const all = raw ? JSON.parse(raw) : {};
+      if(all[email] && all[email].status === "deferred"){
+        delete all[email];
+        await Store.set(TOUR_STATE_KEY, JSON.stringify(all));
+      }
+    }catch(e){ console.error("ATLASTour: could not reset deferred tour state:", e); }
+  }
+
   function root(){ return document.getElementById("atlasTourRoot"); }
 
   function teardown(){
@@ -7411,8 +7425,7 @@ const ATLASTour = (function(){
       </div>`;
     document.getElementById("tourWelcomeStart").onclick = ()=>{ r.innerHTML=""; startTour(); };
     document.getElementById("tourWelcomeSkip").onclick = ()=>{ r.innerHTML=""; saveTourState("skipped"); maybeOfferInstallPrompt(); };
-    // "Maybe Later" intentionally saves no state, so the welcome screen is offered again next login.
-    document.getElementById("tourWelcomeLater").onclick = ()=>{ r.innerHTML=""; };
+    document.getElementById("tourWelcomeLater").onclick = ()=>{ r.innerHTML=""; saveTourState("deferred"); };
   }
 
   function startTour(){
@@ -7430,7 +7443,7 @@ const ATLASTour = (function(){
 
   async function maybeOfferOnLogin(){
     const state = await loadTourState();
-    if(!state || (state.status !== "completed" && state.status !== "skipped")) showWelcome();
+    if(!state || (state.status !== "completed" && state.status !== "skipped" && state.status !== "deferred")) showWelcome();
     else maybeOfferInstallPrompt();
   }
 
@@ -7439,7 +7452,7 @@ const ATLASTour = (function(){
     if(state && (state.status === "completed" || state.status === "skipped")) window.maybeOfferInstallPrompt();
   }
 
-  return { startTour, nextStep, previousStep, skipTour, finishTour, restartTour, showStep, saveTourState, loadTourState, maybeOfferOnLogin, maybeOfferInstallPrompt };
+  return { startTour, nextStep, previousStep, skipTour, finishTour, restartTour, showStep, saveTourState, loadTourState, maybeOfferOnLogin, maybeOfferInstallPrompt, resetDeferredOnLogout };
 })();
 
 document.getElementById("startGuidedTourBtn").addEventListener("click", ()=> ATLASTour.restartTour());
