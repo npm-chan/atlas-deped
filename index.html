@@ -121,11 +121,12 @@
 
     <div class="auth-view" id="authView-verify" style="display:none;">
       <h3 style="text-align:center;margin-bottom:6px;">Verify your email</h3>
-      <p class="hint" style="text-align:center;">A verification link was sent to <b id="verifyEmailLabel"></b>. Verify it, then return here and refresh your status before continuing.</p>
+      <p class="hint" style="text-align:center;">Open the verification link sent to your email before continuing. This is requested once for a new email/password account.</p>
+      <div class="banner" id="verifyBanner" style="display:none;margin-top:2px;margin-bottom:10px;"></div>
       <div class="err-text" id="verifyErr"></div>
-      <button class="btn gold" id="refreshVerifyBtn" style="width:100%;justify-content:center;">I Verified My Email</button>
-      <button class="btn ghost" id="resendVerifyBtn" style="width:100%;justify-content:center;margin-top:8px;">Resend Verification Link</button>
-      <button class="btn ghost" id="verifyLogoutBtn" style="width:100%;justify-content:center;margin-top:8px;">Log Out</button>
+      <button class="btn gold" id="verifyRefreshBtn" style="width:100%;justify-content:center;">I Verified My Email</button>
+      <button class="btn ghost" id="verifyResendBtn" style="width:100%;justify-content:center;margin-top:8px;">Resend Verification Link</button>
+      <div class="auth-hint"><a href="#" id="verifyLogoutBtn">Log out</a></div>
     </div>
 
     <div class="auth-demo-note">Signing in uses real Firebase Authentication — accounts and roles are stored in Cloud Firestore, not just this browser.</div>
