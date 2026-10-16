@@ -128,10 +128,10 @@
 
       <!-- PENDING APPROVAL -->
       <div class="auth-view" id="authView-pending" style="display:none;">
-        <h3 style="text-align:center;margin-bottom:6px;">Account pending approval</h3>
-        <p class="hint" style="text-align:center;">Your account was created, but an existing ATLAS administrator needs
-          to approve it before you can access school data. Contact your division ICT coordinator or system administrator
-          to have your role set to Admin.</p>
+        <h3 style="text-align:center;margin-bottom:6px;">Account workspace unavailable</h3>
+        <p class="hint" id="pendingStatus" style="text-align:center;">ATLAS could not verify or activate your private
+          workspace. Check your network connection and Firestore Security Rules, then try again. Each verified account
+          is an administrator only of its own private workspace.</p>
         <button class="btn ghost" id="pendingLogoutBtn" style="width:100%;justify-content:center;">Log Out</button>
       </div>
 
@@ -1039,10 +1039,9 @@
 
         <!-- DATABASE -->
         <section class="page" id="page-database" data-tour="database">
-          <div class="banner" style="margin-bottom:14px;">ATLAS persists every record locally to this browser profile
-            first — the app works fully offline. Teachers, Sections, and Subjects also sync to a shared cloud database
-            when one is configured below, so changes made on one device reach every other connected device
-            automatically.</div>
+          <div class="banner" style="margin-bottom:14px;">ATLAS stores data in this browser's account-specific private
+            space and syncs it to that account's UID-scoped Firestore records when online. The offline queue and backup
+            are also isolated to the signed-in account; no account can load another account's records.</div>
           <div class="grid cards4" id="dbStatCards" style="margin-bottom:18px;"></div>
 
           <div class="panel" style="margin-bottom:18px;">
