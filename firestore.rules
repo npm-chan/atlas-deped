@@ -1,0 +1,109 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedInAs(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function verifiedAccount() {
+      return request.auth != null &&
+        request.auth.token.email_verified == true;
+    }
+
+    function validProfileFields(data) {
+      return data.keys().hasOnly([
+        'name', 'email', 'role', 'accountType',
+        'createdAt', 'updatedAt', 'verificationSentAt'
+      ]) &&
+        data.email == request.auth.token.email &&
+        data.role in ['pending', 'admin'];
+    }
+
+    function privateCollection(name) {
+      return name in [
+        'appData', 'teachers', 'sections', 'subjects',
+        'classrooms', 'rooms', 'gradeLevels', 'learningAreas',
+        'schoolYears', 'terms', 'schedules', 'teachingLoads',
+        'settings', 'scheduleAssignments', 'conflictHistory'
+      ];
+    }
+
+    function recordOwnerMatches(uid, collection, data) {
+      return (
+        !data.keys().hasAny(['createdBy']) ||
+        data.createdBy == uid
+      ) &&
+      (
+        !data.keys().hasAny(['accountUid']) ||
+        data.accountUid == uid
+      ) &&
+      (
+        collection != 'appData' ||
+        (
+          data.keys().hasAny(['data']) &&
+          data.data is map &&
+          data.data.keys().hasAny(['accountUid']) &&
+          data.data.accountUid == uid
+        )
+      );
+    }
+
+    match /userProfiles/{uid} {
+      allow get: if signedInAs(uid);
+      allow list: if false;
+
+      allow create: if signedInAs(uid) &&
+        validProfileFields(request.resource.data) &&
+        (
+          request.resource.data.role == 'pending' ||
+          (request.resource.data.role == 'admin' && verifiedAccount())
+        );
+
+      allow update: if signedInAs(uid) &&
+        validProfileFields(request.resource.data) &&
+        request.resource.data.email == resource.data.email &&
+        (
+          request.resource.data.role == resource.data.role ||
+          (
+            resource.data.role == 'pending' &&
+            request.resource.data.role == 'admin' &&
+            verifiedAccount()
+          )
+        ) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'accountType', 'updatedAt', 'verificationSentAt', 'role'
+        ]);
+
+      allow delete: if false;
+    }
+
+    match /users/{uid} {
+      // Legacy root documents can contain multi-account snapshots. Keep
+      // them quarantined; application clients must use UID-scoped children.
+      allow read, write: if false;
+
+      match /{collection}/{documentId} {
+        allow get, list: if signedInAs(uid) &&
+          privateCollection(collection) &&
+          recordOwnerMatches(uid, collection, resource.data);
+
+        allow create: if signedInAs(uid) &&
+          privateCollection(collection) &&
+          recordOwnerMatches(uid, collection, request.resource.data);
+
+        allow update: if signedInAs(uid) &&
+          privateCollection(collection) &&
+          recordOwnerMatches(uid, collection, resource.data) &&
+          recordOwnerMatches(uid, collection, request.resource.data);
+
+        allow delete: if signedInAs(uid) &&
+          privateCollection(collection) &&
+          recordOwnerMatches(uid, collection, resource.data);
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
