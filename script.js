@@ -179,31 +179,16 @@ const CURRENT_ROLE = "super_admin";
 function canAccessPage(page){ return true; }
 
 /* =========================================================
-   MULTI-ADMIN DATA ISOLATION
+   ACCOUNT DATA ISOLATION
    ---------------------------------------------------------
-   The school (School Years, Terms, Subjects, Rooms, Grade
-   Configuration, bell schedule, etc.) is SHARED — every signed-in
-   administrator sees the same reference data.
-
-   Teachers and Sections (and, by extension, the schedules built
-   from them) are OWNED per administrator: each admin only sees and
-   manages the faculty/sections they personally created. TEACHERS
-   and SECTIONS (used everywhere else in this file) are kept as a
-   *filtered view* of the true, full datasets — TEACHERS_ALL and
-   SECTIONS_ALL — recomputed whenever data loads or the signed-in
-   admin changes. Every existing function that reads/writes
-   TEACHERS/SECTIONS keeps working unmodified, because it's always
-   looking at "my own records" already.
-
-   NOTE: this is client-side isolation only (no server to enforce
-   it) — it stops one admin's UI from ever listing or letting them
-   edit another admin's records on a shared device, but a
-   technically sophisticated user with direct access to this
-   browser's storage could bypass it. Real, tamper-proof separation
-   would need a backend with server-side access rules.
+   Every module is loaded from one authenticated account's snapshot.
+   Teachers and Sections retain a creator UID as defense in depth;
+   the private UID path, per-UID browser storage, and Firestore Rules
+   are the actual account boundary. Legacy unowned data is never
+   claimed or loaded into a new account automatically.
    ========================================================= */
-let TEACHERS_ALL = TEACHERS.slice();   // every admin's teacher records — the real source of truth
-let SECTIONS_ALL = SECTIONS.slice();   // every admin's section records — the real source of truth (starts empty; nothing is seeded)
+let TEACHERS_ALL = TEACHERS.slice();
+let SECTIONS_ALL = SECTIONS.slice();
 
 function currentAdminId(){
   return (typeof AUTH_SESSION!=="undefined" && AUTH_SESSION && AUTH_SESSION.id) || null;
@@ -211,16 +196,14 @@ function currentAdminId(){
 function currentAdminName(){
   return (typeof AUTH_SESSION!=="undefined" && AUTH_SESSION && (AUTH_SESSION.name||AUTH_SESSION.email)) || "Admin";
 }
-// A record with no owner yet is pre-existing/legacy data — visible until
-// claimed (see claimLegacyOwnership()). Once every record has an owner,
-// this simply means "did I create this?".
+// Private snapshots are validated and backfilled with their owning UID.
 function isOwnedRecord(rec){
   const me = currentAdminId();
   return !rec.createdBy || rec.createdBy === me;
 }
 // Rebuilds the TEACHERS/SECTIONS working arrays from the full datasets,
-// keeping only the current admin's own (+ any not-yet-claimed legacy)
-// records. Call this after login/logout and after any change to the
+// keeping only the current account's own records. Call this after account
+// load and after any change to the
 // *_ALL arrays. Existing array identity is preserved (length=0 + push)
 // since some code may hold onto the TEACHERS/SECTIONS reference.
 function refreshOwnedViews(){
@@ -228,12 +211,10 @@ function refreshOwnedViews(){
   SECTIONS.length = 0; SECTIONS.push(...SECTIONS_ALL.filter(isOwnedRecord));
   recomputeSectionIdx();
 }
-// One-time claim: pre-existing records created before this admin-ownership
-// system existed have no createdBy. The first
-// admin who signs in after this claims them as their own, exactly like
-// migrating a single-admin school into the multi-admin system. Any admin
-// who signs up afterward starts with their own empty roster, as expected.
-function claimLegacyOwnership(){
+// Fill missing owner fields only after records have been loaded from this
+// account's already-isolated private snapshot. Shared legacy sources are
+// not loaded here.
+function backfillPrivateRecordOwners(){
   const me = currentAdminId();
   if(!me) return false;
   let changed = false;
@@ -444,8 +425,7 @@ function computeGradeLoadUsage(assignmentMap){
    Every CRUD action below calls saveData() so edits survive a
    refresh / new session for this browser profile.
    ========================================================= */
-const STORAGE_KEY = "edusched:data:v1";
-const ACCOUNT_OWNER_KEY = "edusched:account-owner:v1";
+const STORAGE_KEY = "edusched:data:v2";
 let saveTimer = null;
 
 /* ---------- Resilient storage layer ----------
@@ -465,6 +445,11 @@ let saveTimer = null;
    directly in a browser instead of inside the host that provides it). */
 const Store = (function(){
   const warned = new Set();
+  function scopedKey(key){
+    const user = typeof firebase!=="undefined" && firebase.auth && firebase.auth().currentUser;
+    if(!user || !user.uid) return null;
+    return "atlas:"+user.uid+":"+key;
+  }
   function warnOnce(key, msg, err){
     const k = key+"|"+msg;
     if(warned.has(k)) return;
@@ -485,6 +470,8 @@ const Store = (function(){
   }
   function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
   async function get(key){
+    key = scopedKey(key);
+    if(!key) return null;
     if(hasBridge()){
       for(let attempt=0; attempt<2; attempt++){
         try{
@@ -505,6 +492,8 @@ const Store = (function(){
     return null;
   }
   async function set(key, value){
+    key = scopedKey(key);
+    if(!key) return false;
     let ok = false;
     if(hasBridge()){
       for(let attempt=0; attempt<2; attempt++){
@@ -523,6 +512,8 @@ const Store = (function(){
     return ok;
   }
   async function del(key){
+    key = scopedKey(key);
+    if(!key) return false;
     let ok = false;
     if(hasBridge()){
       try{ await window.storage.delete(key, false); ok = true; }catch(e){ /* not found is fine */ }
@@ -536,31 +527,17 @@ const Store = (function(){
 })();
 
 /* =========================================================
-   1B-2. OFFLINE-FIRST DATA LAYER + CLOUD SYNC ENGINE (pilot scope)
+   1B-2. OFFLINE-FIRST DATA LAYER + CLOUD SYNC ENGINE
    -----------------------------------------------------------------
-   SCOPE: This layer is wired into three entities — Teachers, Sections,
-   and Subjects — as a working pilot of the full offline+sync
-   architecture. It sits ALONGSIDE the existing whole-app Store/blob
-   persistence above (which still saves/loads everything, including the
-   entities not yet migrated: grade config, curriculum, schedule
-   assignments, school years, terms, rooms, etc.) — nothing about the
-   existing offline behavior for those areas is removed or weakened.
-   Migrating every remaining entity to this same pattern is future work
-   and is called out explicitly in the project notes; it was not done
-   silently or faked here.
+   The whole-app snapshot and per-entity sync both live beneath the
+   authenticated UID. Browser persistence is also UID-scoped.
 
    Why Firestore: it exposes a full REST API reachable with plain
    fetch() calls, so this stays a single dependency-free HTML file — no
    SDK bundle that could fail to load the first time this file is
-   opened offline. Firestore's REST endpoint evaluates unauthenticated
-   requests against Firestore Security Rules, so with permissive rules
-   (see the rules snippet shipped alongside this app) no auth token is
-   needed for this pilot, matching the multi-admin real-time
-   requirement without extra infrastructure. Swap CLOUD_CONFIG.url /
-   the fetch calls below if you'd rather target a different backend —
-   entityTable()/pushOne()/pullRemote()/pingCloud() plus the
-   firestoreEncode/firestoreDecode helpers just below them are the only
-   functions that know about Firestore specifically.
+   opened offline. Requests use the current Firebase ID token and must
+   pass the deployed Firestore Security Rules. Entity sync helpers below
+   keep the REST wire format separate from the application data model.
    ========================================================= */
 
 // ---- Cloud connection config ------------------------------------------
@@ -590,11 +567,19 @@ const IDB_NAME = "atlas_offline_db";
 const IDB_VERSION = 1;
 const IDB_STORES = ["teachers","sections","subjects","sync_queue","conflicts","meta"];
 let _idbPromise = null;
+let _idbUid = null;
 function idbOpen(){
-  if(_idbPromise) return _idbPromise;
+  const uid = typeof firebase!=="undefined" && firebase.auth().currentUser && firebase.auth().currentUser.uid;
+  if(!uid) return Promise.reject(new Error("Sign in is required to access offline account data."));
+  if(_idbPromise && _idbUid===uid) return _idbPromise;
+  if(_idbPromise){
+    _idbPromise.then(db=>db.close()).catch(()=>{});
+    _idbPromise = null;
+  }
+  _idbUid = uid;
   _idbPromise = new Promise((resolve,reject)=>{
     if(!("indexedDB" in window)){ reject(new Error("IndexedDB not supported in this browser")); return; }
-    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    const req = indexedDB.open(IDB_NAME+"_"+uid, IDB_VERSION);
     req.onupgradeneeded = ()=>{
       const db = req.result;
       IDB_STORES.forEach(name=>{
@@ -681,6 +666,8 @@ let LAST_SYNC_AT = null;
 let LAST_SYNC_ERROR = null;
 let SYNC_ACTIVITY = [];
 let PENDING_SYNC = { teachers:new Set(), sections:new Set(), subjects:new Set() };
+const SYNC_IN_FLIGHT_UIDS = new Set();
+let ACCOUNT_SNAPSHOT_READY = false;
 
 function setConnectionState(state){
   CONNECTION_STATE = state;
@@ -727,21 +714,21 @@ function firestoreKeyQS(){
 // what replaces the old "anon key, open rules" pilot setup now that real
 // Firebase Authentication exists. Returns {} (unauthenticated request)
 // if nobody is signed in yet, e.g. during the very first app boot.
-async function firestoreAuthHeader(){
-  try{
-    const user = firebase.auth().currentUser;
-    if(!user) return {};
-    const token = await user.getIdToken();
-    return { Authorization: "Bearer "+token };
-  }catch(e){ console.error("Could not get Firebase ID token:", e); return {}; }
+async function firestoreAuthHeader(expectedUid){
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user) throw new Error("Sign in is required for Firestore access.");
+  if(expectedUid && user.uid!==expectedUid) throw new Error("The active account changed during a Firestore operation.");
+  const token = await user.getIdToken();
+  return { Authorization: "Bearer "+token };
 }
 async function pingCloud(){
-  if(!CLOUD_CONFIG.enabled || !navigator.onLine) return false;
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!CLOUD_CONFIG.enabled || !navigator.onLine || !user) return false;
   try{
     const ctrl = new AbortController();
     const t = setTimeout(()=>ctrl.abort(), 5000);
     const authHeader = await firestoreAuthHeader();
-    const res = await fetch(firestoreBase()+"/teachers?pageSize=1"+firestoreKeyQS(), { signal: ctrl.signal, headers: authHeader });
+    const res = await fetch(firestoreUserCollection(user.uid,"teachers")+"?pageSize=1"+firestoreKeyQS(), { signal: ctrl.signal, headers: authHeader });
     clearTimeout(t);
     // A 403 here almost always means the Project ID is right but Firestore
     // Security Rules are rejecting unauthenticated access — still counts
@@ -760,12 +747,24 @@ window.addEventListener("online", ()=>{
   NET_ONLINE = true;
   renderConnectionIndicator();
   attemptSync();
-  if(typeof firebase !== "undefined" && firebase.auth().currentUser) scheduleAccountSnapshotSave();
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(user){
+    loadAccountSnapshot(user.uid).then(()=>{
+      if(firebase.auth().currentUser?.uid!==user.uid) return;
+      ACCOUNT_SNAPSHOT_READY = true;
+      scheduleAccountSnapshotSave(user.uid);
+    }).catch(error=>{
+      console.error("Could not verify private account snapshot after reconnect:", error);
+      ACCOUNT_SNAPSHOT_READY = false;
+    });
+  }
 });
 window.addEventListener("offline", ()=>{ NET_ONLINE = false; setConnectionState("offline"); });
 
 // ---- Sync queue ----------------------------------------------------------
 async function enqueueChange(entityType, entityId, opType, payload){
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user) throw new Error("Sign in is required to queue account data.");
   const op = {
     id: makeId(), // sync_queue store's own primary key
     operation_id: makeId(),
@@ -776,7 +775,7 @@ async function enqueueChange(entityType, entityId, opType, payload){
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     device_id: await getDeviceId(),
-    user_id: (typeof AUTH_SESSION!=="undefined" && AUTH_SESSION && AUTH_SESSION.email) || "unknown",
+    user_id: user.uid,
     sync_status: "pending",
     retry_count: 0,
     last_error: null
@@ -787,8 +786,15 @@ async function enqueueChange(entityType, entityId, opType, payload){
 }
 async function getPendingQueue(){
   const all = await idbGetAll("sync_queue");
-  return all.filter(o=>o.sync_status==="pending" || o.sync_status==="failed")
+  const uid = typeof firebase!=="undefined" && firebase.auth().currentUser && firebase.auth().currentUser.uid;
+  return all.filter(o=>o.user_id===uid && (o.sync_status==="pending" || o.sync_status==="failed"))
              .sort((a,b)=> a.created_at.localeCompare(b.created_at));
+}
+function firestoreUserCollection(uid, collection){
+  return firestoreBase()+"/users/"+encodeURIComponent(uid)+"/"+encodeURIComponent(collection);
+}
+function firestoreUserDocument(uid, collection, docId){
+  return firestoreUserCollection(uid,collection)+"/"+encodeURIComponent(docId);
 }
 function entityTable(entityType){
   // Doubles as the Firestore collection name for each entity.
@@ -832,11 +838,15 @@ function firestoreDecodeFields(fields){
   return obj;
 }
 async function pushOne(op){
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user || !op.user_id || user.uid!==op.user_id) return { ok:false, error:"Queued change belongs to a different or signed-out account." };
   const table = entityTable(op.entity_type);
   if(!table) return { ok:false, error:"Unknown entity type: "+op.entity_type };
-  const docUrl = firestoreBase()+"/"+table+"/"+encodeURIComponent(op.entity_id)+firestoreKeyQS();
-  const authHeader = await firestoreAuthHeader();
+  const docUrl = firestoreUserDocument(op.user_id,table,op.entity_id)+firestoreKeyQS();
   try{
+    const token = await user.getIdToken();
+    if(firebase.auth().currentUser?.uid!==op.user_id) return { ok:false, error:"Account changed before the queued write could be sent." };
+    const authHeader = { Authorization:"Bearer "+token };
     let res;
     if(op.operation_type==="DELETE"){
       res = await fetch(docUrl, { method:"DELETE", headers: authHeader });
@@ -879,35 +889,22 @@ async function pushQueue(){
 }
 async function pullRemote(entityType){
   const table = entityTable(entityType);
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user) return false;
   const sinceRec = await idbGet("meta","last_pull_"+entityType);
   const sinceVal = sinceRec ? sinceRec.value : "1970-01-01T00:00:00.000000Z";
   // Firestore's REST API has no "?field=gt.value" querystring filter like
   // PostgREST — the equivalent is a structured query POSTed to :runQuery.
-  const url = firestoreBase()+":runQuery"+firestoreKeyQS();
+  const url = firestoreBase()+"/users/"+encodeURIComponent(user.uid)+":runQuery"+firestoreKeyQS();
   const updatedAtFilter = { fieldFilter: {
     field: { fieldPath: "updated_at" },
     op: "GREATER_THAN",
     value: { timestampValue: sinceVal }
   }};
-  // Teachers/Sections are owned per-admin — the Security Rules only allow
-  // reading a doc whose createdBy == the caller's uid. Firestore rejects a
-  // list/runQuery request outright unless the query's own filters already
-  // guarantee every possible result would pass the rule, so this
-  // createdBy filter has to be here for the pull to be allowed at all.
-  // Subjects stays unfiltered — it's shared reference data every admin can read.
-  let where = updatedAtFilter;
-  if(entityType==="teachers" || entityType==="sections"){
-    const uid = typeof firebase!=="undefined" && firebase.auth().currentUser && firebase.auth().currentUser.uid;
-    if(!uid) return false; // not signed in yet — nothing this admin owns to pull
-    where = { compositeFilter: { op:"AND", filters: [
-      updatedAtFilter,
-      { fieldFilter: { field:{ fieldPath:"createdBy" }, op:"EQUAL", value:{ stringValue: uid } } }
-    ]}};
-  }
   const body = {
     structuredQuery: {
       from: [{ collectionId: table }],
-      where,
+      where:updatedAtFilter,
       orderBy: [{ field: { fieldPath: "updated_at" }, direction: "ASCENDING" }]
     }
   };
@@ -972,26 +969,41 @@ async function resolveConflict(conflictId, choice){ // choice: "local" | "server
   if(navigator.onLine) attemptSync();
 }
 
-let syncInFlight = false;
 async function attemptSync(force){
-  if(syncInFlight) return;
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user || !AUTH_SESSION || AUTH_SESSION.uid!==user.uid) return;
+  const uid = user.uid;
+  if(SYNC_IN_FLIGHT_UIDS.has(uid)) return;
   if(!force && !AUTO_SYNC_ENABLED){ return; }
   if(!CLOUD_CONFIG.enabled){ setConnectionState("offline"); return; }
   if(!navigator.onLine){ setConnectionState("offline"); return; }
-  syncInFlight = true;
+  SYNC_IN_FLIGHT_UIDS.add(uid);
   setConnectionState("syncing");
-  const reachable = await pingCloud();
-  if(!reachable){
-    syncInFlight = false; setConnectionState("offline"); scheduleSyncRetry(15000); return;
+  try{
+    const reachable = await pingCloud();
+    if(!reachable){
+      if(firebase.auth().currentUser?.uid===uid){ setConnectionState("offline"); scheduleSyncRetry(15000); }
+      return;
+    }
+    const pushOk = await pushQueue();
+    if(firebase.auth().currentUser?.uid!==uid) return;
+    for(const t of ["teachers","sections","subjects"]) await pullRemote(t);
+    if(firebase.auth().currentUser?.uid!==uid) return;
+    LAST_SYNC_AT = new Date();
+    await idbPut("meta", { key:"last_sync_at", value: LAST_SYNC_AT.toISOString() });
+    if(pushOk){ LAST_SYNC_ERROR = null; setConnectionState("online"); }
+    else { LAST_SYNC_ERROR = "Some changes could not be synchronized. They will be retried automatically."; setConnectionState("error"); scheduleSyncRetry(30000); }
+    renderAll();
+  }catch(error){
+    console.error("Account sync failed:", error);
+    if(firebase.auth().currentUser?.uid===uid){
+      LAST_SYNC_ERROR = "Synchronization failed. Changes remain queued for retry.";
+      setConnectionState("error");
+      scheduleSyncRetry(30000);
+    }
+  }finally{
+    SYNC_IN_FLIGHT_UIDS.delete(uid);
   }
-  const pushOk = await pushQueue();
-  for(const t of ["teachers","sections","subjects"]) await pullRemote(t);
-  LAST_SYNC_AT = new Date();
-  await idbPut("meta", { key:"last_sync_at", value: LAST_SYNC_AT.toISOString() });
-  syncInFlight = false;
-  if(pushOk){ LAST_SYNC_ERROR = null; setConnectionState("online"); }
-  else { LAST_SYNC_ERROR = "Some changes could not be synchronized. They will be retried automatically."; setConnectionState("error"); scheduleSyncRetry(30000); }
-  renderAll();
 }
 
 // ---- Persist+queue helper used by Teacher/Section/Subject CRUD --------
@@ -1066,6 +1078,7 @@ function setSaveIndicator(state){
 
 function snapshotData(){
   return {
+    accountUid: typeof firebase!=="undefined" && firebase.auth().currentUser ? firebase.auth().currentUser.uid : null,
     teachersAll: TEACHERS_ALL,
     sectionsAll: SECTIONS_ALL.map(s=>({id:s.id, grade:s.grade, name:s.name, strand:s.strand, roomId:s.roomId, sectionType:s.sectionType, specialProgram:s.specialProgram, adviserId:s.adviserId, classShift:s.classShift, createdBy:s.createdBy})),
     currentTerm: CURRENT_TERM,
@@ -1111,15 +1124,58 @@ function snapshotData(){
     scheduleDataVersion: 2
   };
 }
+const EMPTY_ACCOUNT_SNAPSHOT = JSON.parse(JSON.stringify(snapshotData()));
+function validateSnapshotForAccount(data, uid){
+  if(!data || typeof data!=="object" || !uid || data.accountUid!==uid){
+    throw new Error("This backup is not marked as belonging to the signed-in account.");
+  }
+  for(const key of ["teachersAll","sectionsAll"]){
+    const records = data[key] || [];
+    if(!Array.isArray(records) || records.some(record=>record.createdBy && record.createdBy!==uid)){
+      throw new Error("The backup contains teacher or section records owned by a different account.");
+    }
+    records.forEach(record=>{ record.createdBy = uid; });
+  }
+}
+function clearAccountState(){
+  AUTH_SESSION = null;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  clearTimeout(syncTimer);
+  syncTimer = null;
+  applySnapshot(JSON.parse(JSON.stringify(EMPTY_ACCOUNT_SNAPSHOT)));
+  LAST_SAVED_AT = null;
+  LAST_SYNC_AT = null;
+  LAST_SYNC_ERROR = null;
+  SYNC_ACTIVITY = [];
+  ACCOUNT_SNAPSHOT_READY = false;
+  PENDING_SYNC = { teachers:new Set(), sections:new Set(), subjects:new Set() };
+  LAST_AUTOFIX_SNAPSHOT = null;
+  LAST_CHANGES = [];
+  CONFLICTS_CACHE = [];
+  SELECTED_CONFLICT_IDS.clear();
+  conflictPageState.list = 0;
+  conflictPageState.autofix = 0;
+  conflictPageState.history = 0;
+  conflictPageState.changes = 0;
+}
 
 async function saveData(){
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user){
+    setSaveIndicator("error");
+    showToast("Sign in is required before account data can be saved.", true);
+    return;
+  }
   setSaveIndicator("saving");
   try{
-    const ok = await Store.set(STORAGE_KEY, JSON.stringify(snapshotData()));
+    const data = snapshotData();
+    if(data.accountUid!==user.uid) throw new Error("The active account changed before data could be saved.");
+    const ok = await Store.set(STORAGE_KEY, JSON.stringify(data));
     LAST_SAVED_AT = new Date();
     if(ok){
       setSaveIndicator("saved");
-      scheduleAccountSnapshotSave();
+      scheduleAccountSnapshotSave(user.uid);
     }else{
       // Neither the storage bridge nor localStorage accepted the write —
       // a genuine failure (e.g. storage disabled/full), worth surfacing.
@@ -1133,12 +1189,14 @@ async function saveData(){
   }
 }
 let LAST_SAVED_AT = null;
-function scheduleAccountSnapshotSave(){
+function scheduleAccountSnapshotSave(expectedUid){
   clearTimeout(saveTimer);
-  if(typeof firebase === "undefined" || !firebase.auth().currentUser) return;
+  const user = typeof firebase!=="undefined" && firebase.auth().currentUser;
+  if(!user || (expectedUid && user.uid!==expectedUid)) return;
+  const uid = expectedUid || user.uid;
   saveTimer = setTimeout(async ()=>{
     saveTimer = null;
-    await saveAccountSnapshot();
+    await saveAccountSnapshot(uid);
   }, 900);
 }
 
@@ -1146,40 +1204,46 @@ function scheduleAccountSnapshotSave(){
 // between devices. On logout, mirror the complete account snapshot into the
 // signed-in user's Firestore profile; the next login restores it before the
 // app initializes.
-async function saveAccountSnapshot(){
+async function saveAccountSnapshot(expectedUid){
   clearTimeout(saveTimer);
   saveTimer = null;
   const user = firebase.auth().currentUser;
-  if(!user || !CLOUD_CONFIG.enabled || !navigator.onLine) return false;
+  if(!user || !expectedUid || user.uid!==expectedUid || !ACCOUNT_SNAPSHOT_READY || !CLOUD_CONFIG.enabled || !navigator.onLine) return false;
   try{
     const accountSnapshot = snapshotData();
-    accountSnapshot.teachersAll = accountSnapshot.teachersAll.filter(record=>!record.createdBy || record.createdBy===user.uid);
-    accountSnapshot.sectionsAll = accountSnapshot.sectionsAll.filter(record=>!record.createdBy || record.createdBy===user.uid);
-    const ownedSectionIds = new Set(accountSnapshot.sectionsAll.map(section=>section.id));
-    accountSnapshot.scheduleGradeConfig = Object.fromEntries(
-      Object.entries(accountSnapshot.scheduleGradeConfig||{}).filter(([sectionId])=>ownedSectionIds.has(sectionId))
-    );
-    const authHeader = await firestoreAuthHeader();
-    const query = "?updateMask.fieldPaths=appData&updateMask.fieldPaths=appDataUpdatedAt" +
+    if(accountSnapshot.accountUid!==expectedUid) return false;
+    accountSnapshot.accountUid = user.uid;
+    const authHeader = await firestoreAuthHeader(user.uid);
+    const query = "?updateMask.fieldPaths=data&updateMask.fieldPaths=updatedAt" +
       (CLOUD_CONFIG.anonKey ? "&key="+encodeURIComponent(CLOUD_CONFIG.anonKey) : "");
-    const res = await fetch(firestoreBase()+"/users/"+encodeURIComponent(user.uid)+query, {
+    const res = await fetch(firestoreUserDocument(user.uid,"appData","current")+query, {
       method:"PATCH",
       headers:Object.assign({"Content-Type":"application/json"}, authHeader),
       body:JSON.stringify({ fields:firestoreEncodeFields({
-        appData:accountSnapshot,
-        appDataUpdatedAt:new Date().toISOString()
+        data:accountSnapshot,
+        updatedAt:new Date().toISOString()
       }) })
     });
     if(!res.ok){
       const text = await res.text().catch(()=>'');
       throw new Error("HTTP "+res.status+" "+text.slice(0,180));
     }
-    await Store.set(ACCOUNT_OWNER_KEY, user.uid);
     return true;
   }catch(e){
     console.error("Account snapshot save failed:", e);
     return false;
   }
+}
+async function loadAccountSnapshot(uid){
+  const authHeader = await firestoreAuthHeader(uid);
+  const res = await fetch(firestoreUserDocument(uid,"appData","current")+firestoreKeyQS(), { headers:authHeader });
+  if(res.status===404) return null;
+  if(!res.ok) throw new Error("Could not load private account data (HTTP "+res.status+")");
+  const doc = await res.json();
+  const data = firestoreDecodeFields(doc.fields).data;
+  if(!data || data.accountUid!==uid) throw new Error("Private account data has a missing or mismatched UID; refusing to load it.");
+  validateSnapshotForAccount(data,uid);
+  return data;
 }
 
 // Older saved data tagged teachers with a whole tier ("JHS"/"SHS") instead of
@@ -1237,12 +1301,9 @@ function migrateTeacherGradeLoadsIn(list){
 }
 
 function applySnapshot(data){
-  // teachersAll/sectionsAll (with per-record createdBy ownership) are the
-  // current format. Older saves only have "teachers"/"sections" (from
-  // before multi-admin isolation existed) — load those into the same
-  // *_ALL arrays as unowned/legacy records; claimLegacyOwnership() (called
-  // right after sign-in) then assigns them to whichever admin logs in
-  // first, exactly like migrating a single-admin school forward.
+  // This snapshot is loaded only from the current account's private UID path.
+  // Older snapshots may lack creator fields, which are backfilled after
+  // validation; unscoped browser and legacy cloud snapshots are not loaded.
   TEACHERS_ALL = data.teachersAll || data.teachers || [];
   SECTIONS_ALL = (data.sectionsAll || data.sections || []).map(s=>({...s}));
   migrateTeacherGradeLoadsIn(TEACHERS_ALL);
@@ -1333,19 +1394,25 @@ function applySnapshot(data){
 }
 
 async function loadData(){
+  const uid = firebase.auth().currentUser && firebase.auth().currentUser.uid;
+  if(!uid) return false;
   try{
+    applySnapshot(JSON.parse(JSON.stringify(EMPTY_ACCOUNT_SNAPSHOT)));
     const value = await Store.get(STORAGE_KEY);
+    if(firebase.auth().currentUser?.uid!==uid) return false;
     if(value){
-      applySnapshot(JSON.parse(value));
+      const data = JSON.parse(value);
+      validateSnapshotForAccount(data,uid);
+      applySnapshot(data);
       return true;
     }
     // No stored value yet — this is the normal first run, not a failure.
     return false;
   }catch(e){
-    // Store.get() itself never throws; this only fires if the saved JSON
-    // is corrupted (JSON.parse) or applySnapshot() chokes on bad data.
+    // Do not let initialization overwrite a corrupt or mismatched private
+    // snapshot with a generated empty schedule.
     console.error("Storage load failed:", e);
-    showToast("Saved data looked corrupted — starting from a clean, empty state instead.", true);
+    throw e;
   }
   return false;
 }
@@ -4256,7 +4323,7 @@ function renderReports(){
 const DB_TABLES = [
   { key:"teachers", label:"Teachers", get:()=>TEACHERS.length, desc:"Faculty roster, specializations, and status (your own records only)", clearable:true },
   { key:"sections", label:"Sections", get:()=>SECTIONS.length, desc:"Class sections per grade level and track (your own records only)", clearable:true },
-  { key:"rooms", label:"Rooms", get:()=>ROOMS.length, desc:"Classrooms and shared facilities — shared across every admin", clearable:true },
+  { key:"rooms", label:"Rooms", get:()=>ROOMS.length, desc:"Classrooms and shared facilities in this account", clearable:true },
   { key:"schoolYears", label:"School Years", get:()=>SCHOOL_YEARS.length, desc:"School Year records and their status" },
   { key:"terms", label:"Terms", get:()=>TERMS.length, desc:"Terms available across every School Year" },
   { key:"subjects", label:"Subjects", get:()=>SUBJECTS.length, desc:"Subject records added per School Year + Term + Grade Level", clearable:true },
@@ -4279,15 +4346,13 @@ function renderDatabase(){
 // Permanently removes every record from a clearable table — from the
 // in-memory arrays, the local IndexedDB/localStorage blob, and (if
 // connected) the synced cloud database — via the same persistEntityChange
-// pipeline every individual delete already goes through. Teachers, Sections,
-// and Schedule Assignments only clear the current admin's own records (see
-// the multi-admin data isolation model); Rooms and Subjects are shared
-// school-wide resources, so clearing those affects every admin.
+// pipeline every individual delete already goes through. All affected data
+// belongs to the authenticated account's private snapshot and UID path.
 async function clearAllOfTable(key){
   if(key==="subjects"){
     const count = SUBJECTS.length;
     if(count===0){ showToast("There are no Subjects to clear.", true); return; }
-    openConfirm(`Permanently delete all ${count} Subject record${count===1?'':'s'} — across every School Year, Term, and Grade Level? This cannot be undone.`, async ()=>{
+    openConfirm(`Permanently delete all ${count} Subject record${count===1?'':'s'} in this account — across every School Year, Term, and Grade Level? This cannot be undone.`, async ()=>{
       const ids = SUBJECTS.map(s=>s.id);
       SUBJECTS.length = 0;
       subjectIdCounter = 1;
@@ -4334,7 +4399,7 @@ async function clearAllOfTable(key){
   } else if(key==="rooms"){
     const count = ROOMS.length;
     if(count===0){ showToast("There are no Rooms to clear.", true); return; }
-    openConfirm(`Permanently delete all ${count} Room record${count===1?'':'s'}? Rooms are shared across every administrator — sections currently assigned to a deleted room will show as Unassigned. This cannot be undone.`, async ()=>{
+    openConfirm(`Permanently delete all ${count} Room record${count===1?'':'s'} in this account? Sections currently assigned to a deleted room will show as Unassigned. This cannot be undone.`, async ()=>{
       ROOMS.length = 0;
       roomCounter = 1;
       await saveData();
@@ -4355,6 +4420,7 @@ async function clearAllOfTable(key){
   }
 }
 document.getElementById("dbExportBtn").addEventListener("click", ()=>{
+  if(!currentAdminId()){ showToast("Sign in before exporting account data.", true); return; }
   const blob = new Blob([JSON.stringify(snapshotData(), null, 2)], {type:"application/json"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -4373,6 +4439,7 @@ document.getElementById("dbImportFile").addEventListener("change", (e)=>{
     openConfirm("Import this file and replace all current data? This cannot be undone.", async ()=>{
       try{
         const data = JSON.parse(reader.result);
+        validateSnapshotForAccount(data,currentAdminId());
         applySnapshot(data);
         await saveData();
         renderAll();
@@ -4389,11 +4456,9 @@ document.getElementById("dbImportFile").addEventListener("change", (e)=>{
 document.getElementById("settingsGoDbBtn").addEventListener("click", ()=> navigateTo("database"));
 
 /* =========================================================
-   SYNC CENTER — live status cards,
-   pending-queue count, recent activity, and conflict resolution
-   UI for the offline-first data layer defined earlier (Teachers,
-   Sections, Subjects). See the big comment near CLOUD_CONFIG for
-   why only these three entities are wired up so far.
+   SYNC CENTER — live status cards, pending-queue count, recent
+   activity, and conflict resolution for per-entity sync. All other
+   app modules are persisted in the account's private full snapshot.
    ========================================================= */
 let CONFLICTS_CACHE = [];
 async function renderSyncCenter(){
@@ -7325,29 +7390,26 @@ document.getElementById("fsCancelEditBtn").addEventListener("click", cancelFinal
 document.getElementById("fsSaveFinalizeBtn").addEventListener("click", ()=>saveFinalScheduleChanges(true));
 document.getElementById("fsAuditBtn").addEventListener("click", openFinalAuditModal);
 
-async function initApp(){
-  let loaded = false;
+async function initApp(expectedUid){
+  let loaded;
   try{
     loaded = await loadData();
   }catch(e){
-    // A saved snapshot that's corrupted or from an incompatible older
-    // version could otherwise throw here and leave the app stuck on a
-    // blank screen. Log it, warn the user once, and continue with an
-    // empty in-memory state instead of failing the whole boot.
-    console.error("initApp: loadData threw, continuing with an empty state:", e);
-    showToast("Saved data couldn't be read — starting from a clean, empty state instead.", true);
-    loaded = false;
+    console.error("initApp: private data could not be loaded:", e);
+    showPendingView("Your private data could not be read safely. It was not overwritten. Resolve the storage issue, then sign in again.");
+    return false;
   }
-  // Claim any pre-existing/unowned Teacher & Section records for this admin
-  // (see claimLegacyOwnership() — a one-time migration for data created
-  // before per-admin ownership existed). No-op once every record has an
-  // owner.
-  if(claimLegacyOwnership()) refreshOwnedViews();
+  if(firebase.auth().currentUser?.uid!==expectedUid) return false;
+  // Backfill creator UIDs only on records loaded from this account's private
+  // snapshot; never claim records from legacy shared data.
+  if(backfillPrivateRecordOwners()) refreshOwnedViews();
   if(!loaded || Object.keys(SCHEDULE_ASSIGNMENTS).length===0){
     await generateSchedule(); // first run (or nothing generated yet): produce an initial schedule
   }
+  if(firebase.auth().currentUser?.uid!==expectedUid) return false;
   initSubjectFilters();
   await saveData();
+  if(firebase.auth().currentUser?.uid!==expectedUid) return false;
 
   // ---- Offline-first data layer + cloud sync engine startup ----------
   // Runs after the main blob load/save above so the in-memory arrays
@@ -7366,6 +7428,7 @@ async function initApp(){
     console.error("initApp: offline/sync layer failed to start — continuing in blob-only offline mode:", e);
     setConnectionState("offline");
   }
+  if(firebase.auth().currentUser?.uid!==expectedUid) return false;
 
   try{
     renderAll();
@@ -7373,16 +7436,16 @@ async function initApp(){
     console.error("initApp: renderAll failed:", e);
     showToast("Something went wrong rendering the app. Check the console for details.", true);
   }
+  return true;
 }
 
 /* =========================================================
    0. AUTHENTICATION (Firebase Authentication)
    Real accounts: Firebase Authentication (email/password and Google
    Sign-In) is the identity provider, and each user's role lives in the
-   users/{uid} Firestore document — never trusted from anything the
-   client sends. See firestoreAuthHeader() above: every Firestore REST
-   call already attaches the signed-in user's ID token so Firestore
-   Security Rules can check request.auth on the server side.
+   userProfiles/{uid} Firestore document — never trusted from anything
+   the client sends. Every Firestore REST call attaches the signed-in
+   user's ID token so Security Rules can check request.auth server-side.
 
    DepEd SSO: Google Sign-In is restricted to ALLOWED_GOOGLE_DOMAIN
    below. Set this to your division's real Google Workspace domain
@@ -7402,26 +7465,70 @@ function buildGoogleProvider(){
 
 let AUTH_SESSION = null; // { id (Firebase uid), uid, name, email, role }
 let WELCOME_TOAST_MESSAGE = null;
+let AUTH_FLOW_ID = 0;
+let verificationWatchTimer = null;
+let verificationWatchUid = null;
+
+function stopEmailVerificationWatcher(){
+  if(verificationWatchTimer) clearInterval(verificationWatchTimer);
+  verificationWatchTimer = null;
+  verificationWatchUid = null;
+}
+function startEmailVerificationWatcher(fbUser){
+  if(verificationWatchUid===fbUser.uid && verificationWatchTimer) return;
+  stopEmailVerificationWatcher();
+  verificationWatchUid = fbUser.uid;
+  verificationWatchTimer = setInterval(async ()=>{
+    const currentUser = firebase.auth().currentUser;
+    if(!currentUser || currentUser.uid!==verificationWatchUid){
+      stopEmailVerificationWatcher();
+      return;
+    }
+    if(document.visibilityState==="hidden") return;
+    try{
+      await currentUser.reload();
+      if(currentUser.emailVerified){
+        stopEmailVerificationWatcher();
+        await handleAuthenticatedUser(currentUser,AUTH_FLOW_ID);
+      }
+    }catch(error){
+      console.warn("Email verification status check failed:", error);
+    }
+  },4000);
+}
 
 function isValidEmail(v){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v); }
 
-// ---- users/{uid} Firestore profile doc (name, email, role) ------------
+// ---- userProfiles/{uid} Firestore identity doc ------------------------
 async function getUserProfileDoc(uid){
-  const authHeader = await firestoreAuthHeader();
-  const res = await fetch(firestoreBase()+"/users/"+encodeURIComponent(uid)+firestoreKeyQS(), { headers: authHeader });
+  const authHeader = await firestoreAuthHeader(uid);
+  const res = await fetch(firestoreBase()+"/userProfiles/"+encodeURIComponent(uid)+firestoreKeyQS(), { headers: authHeader });
   if(res.status===404) return null;
   if(!res.ok) throw new Error("Could not load user profile (HTTP "+res.status+")");
   const doc = await res.json();
   return firestoreDecodeFields(doc.fields);
 }
 async function createUserProfileDoc(uid, profile){
-  const authHeader = await firestoreAuthHeader();
-  const res = await fetch(firestoreBase()+"/users/"+encodeURIComponent(uid)+firestoreKeyQS(), {
+  const authHeader = await firestoreAuthHeader(uid);
+  const res = await fetch(firestoreBase()+"/userProfiles/"+encodeURIComponent(uid)+firestoreKeyQS(), {
     method:"PATCH",
     headers: Object.assign({ "Content-Type":"application/json" }, authHeader),
     body: JSON.stringify({ fields: firestoreEncodeFields(profile) })
   });
   if(!res.ok){ const t = await res.text().catch(()=>""); throw new Error("Could not create user profile (HTTP "+res.status+") "+t.slice(0,200)); }
+}
+async function updateUserProfileDoc(uid, fields){
+  const authHeader = await firestoreAuthHeader(uid);
+  const mask = Object.keys(fields).map(key=>"updateMask.fieldPaths="+encodeURIComponent(key)).join("&");
+  const res = await fetch(firestoreBase()+"/userProfiles/"+encodeURIComponent(uid)+"?"+mask+firestoreKeyQS().replace("?","&"), {
+    method:"PATCH",
+    headers:Object.assign({ "Content-Type":"application/json" }, authHeader),
+    body:JSON.stringify({ fields:firestoreEncodeFields(fields) })
+  });
+  if(!res.ok){
+    const text = await res.text().catch(()=>"");
+    throw new Error("Could not update user profile (HTTP "+res.status+") "+text.slice(0,200));
+  }
 }
 
 function switchAuthTab(tab){
@@ -7452,13 +7559,15 @@ function showForgotView(){
   document.getElementById("forgotErr").textContent = "";
   document.getElementById("forgotBanner").style.display = "none";
 }
-function showPendingView(){
+function showPendingView(message){
   document.querySelectorAll(".auth-tab").forEach(b=> b.classList.remove("active"));
   document.getElementById("authView-login").style.display = "none";
   document.getElementById("authView-signup").style.display = "none";
   document.getElementById("authView-forgot").style.display = "none";
   document.getElementById("authView-pending").style.display = "block";
   document.getElementById("authView-verify").style.display = "none";
+  const status = document.getElementById("pendingStatus");
+  if(status) status.textContent = message || "ATLAS could not verify or activate your private workspace. Check your network connection and Firestore Security Rules, then try again. Each verified account is an administrator only of its own private workspace.";
 }
 function showEmailVerificationView(){
   document.querySelectorAll(".auth-tab").forEach(b=> b.classList.remove("active"));
@@ -7485,9 +7594,18 @@ document.getElementById("verifyLogoutBtn").addEventListener("click", e=>{ e.prev
 document.getElementById("verifyRefreshBtn").addEventListener("click", async ()=>{
   const user = firebase.auth().currentUser;
   if(!user) return;
-  await user.reload();
-  if(user.emailVerified) location.reload();
-  else document.getElementById("verifyErr").textContent = "Your email is not verified yet. Open the link in your email, then try again.";
+  try{
+    await user.reload();
+    if(user.emailVerified){
+      stopEmailVerificationWatcher();
+      await handleAuthenticatedUser(user,AUTH_FLOW_ID);
+    }else{
+      document.getElementById("verifyErr").textContent = "Your email is not verified yet. Open the link in your email; ATLAS will sign you in automatically once verification is detected.";
+    }
+  }catch(error){
+    console.error("Could not refresh email verification:", error);
+    document.getElementById("verifyErr").textContent = "Could not check email verification. Please try again.";
+  }
 });
 document.getElementById("verifyResendBtn").addEventListener("click", async ()=>{
   const user = firebase.auth().currentUser;
@@ -7504,34 +7622,22 @@ document.getElementById("verifyResendBtn").addEventListener("click", async ()=>{
 
 firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(error=>console.warn("ATLAS could not enable persistent login:", error));
 
-// Called by firebase.auth().onAuthStateChanged whenever a real Firebase
-// user is signed in. Loads (or, on first sign-in, creates) that user's
-// users/{uid} Firestore doc, then either shows the full app (role
-// "admin") or a pending-approval screen (any other role) — this is the
-// server-verified gate the migration spec asks for, replacing the old
-// "every signed-in account is an admin" demo behavior.
-//
-// Every brand-new account — including a Google sign-in that passed the
-// ALLOWED_GOOGLE_DOMAIN check above — starts as role "pending", never
-// "admin", and the matching Firestore Security Rule only allows a user
-// to create their OWN doc with role "pending". Auto-granting "admin"
-// client-side just because the email domain matched would mean the
-// client is deciding its own authorization, which is exactly what
-// section 4's security requirement (and section 14) rules out; genuinely
-// automatic promotion for verified DepEd accounts needs a server-side
-// Cloud Function setting a custom claim, which isn't part of this pass —
-// see the Firebase Setup Checklist for how to promote the first admin.
-async function handleAuthenticatedUser(fbUser){
+// Each verified account gets admin controls only inside its own UID-scoped
+// workspace. Firestore Rules enforce the path ownership independently.
+async function handleAuthenticatedUser(fbUser, flowId){
+  ACCOUNT_SNAPSHOT_READY = false;
+  flowId = flowId || AUTH_FLOW_ID;
   let profile;
   try{
     profile = await getUserProfileDoc(fbUser.uid);
+    if(flowId!==AUTH_FLOW_ID || firebase.auth().currentUser?.uid!==fbUser.uid) return;
     if(!profile){
       const isGoogle = fbUser.providerData.some(p=>p.providerId==="google.com");
       const nowIso = new Date().toISOString();
       profile = {
         name: fbUser.displayName || fbUser.email,
         email: fbUser.email,
-        role: "pending",
+        role: fbUser.emailVerified ? "admin" : "pending",
         accountType: isGoogle ? "deped" : "email",
         createdAt: nowIso,
         updatedAt: nowIso
@@ -7539,6 +7645,7 @@ async function handleAuthenticatedUser(fbUser){
       await createUserProfileDoc(fbUser.uid, profile);
     }
   }catch(e){
+    if(flowId!==AUTH_FLOW_ID || firebase.auth().currentUser?.uid!==fbUser.uid) return;
     console.error("Could not load/create user profile:", e);
     showToast("Signed in, but couldn't reach the user profile database. Some features may not work until this is resolved.", true);
     profile = { name: fbUser.displayName || fbUser.email, email: fbUser.email, role: "pending" };
@@ -7550,7 +7657,27 @@ async function handleAuthenticatedUser(fbUser){
     document.getElementById("authScreen").style.display = "flex";
     document.getElementById("appRoot").classList.remove("authed");
     showEmailVerificationView();
+    startEmailVerificationWatcher(fbUser);
     return;
+  }
+
+  stopEmailVerificationWatcher();
+  if(fbUser.emailVerified && AUTH_SESSION.role==="pending"){
+    try{
+      const updatedAt = new Date().toISOString();
+      await fbUser.getIdToken(true);
+      await updateUserProfileDoc(fbUser.uid,{ role:"admin", updatedAt:new Date().toISOString() });
+      if(flowId!==AUTH_FLOW_ID || firebase.auth().currentUser?.uid!==fbUser.uid) return;
+      profile.role = "admin";
+      AUTH_SESSION.role = "admin";
+    }catch(error){
+      console.error("Could not activate verified account:", error);
+      showToast("Your email is verified, but this account workspace could not be activated. Check Firestore Rules and try again.", true);
+      document.getElementById("authScreen").style.display = "flex";
+      document.getElementById("appRoot").classList.remove("authed");
+      showPendingView();
+      return;
+    }
   }
 
   if(AUTH_SESSION.role !== "admin"){
@@ -7560,38 +7687,62 @@ async function handleAuthenticatedUser(fbUser){
     return;
   }
 
-  // Prefer the account's cloud snapshot over any device-local copy. This is
-  // what makes a signed-in account portable to a phone, tablet, or laptop.
+  // Restore only the new UID-scoped private snapshot. Old unscoped snapshots
+  // and /users/{uid}.appData records remain quarantined for manual review.
   try{
-    const localOwner = await Store.get(ACCOUNT_OWNER_KEY);
-    if(profile.appData && typeof profile.appData === "object"){
-      await Store.set(STORAGE_KEY, JSON.stringify(profile.appData));
-    }else if(localOwner && localOwner !== fbUser.uid){
-      await Store.del(STORAGE_KEY);
-      applySnapshot({});
+    if(navigator.onLine){
+      const cloudData = await loadAccountSnapshot(fbUser.uid);
+      if(flowId!==AUTH_FLOW_ID || firebase.auth().currentUser?.uid!==fbUser.uid) return;
+      if(cloudData){
+        const saved = await Store.set(STORAGE_KEY, JSON.stringify(cloudData));
+        if(!saved) throw new Error("Could not cache the private account snapshot on this device.");
+      }
+      ACCOUNT_SNAPSHOT_READY = true;
+    }else{
+      const localSnapshot = await Store.get(STORAGE_KEY);
+      if(!localSnapshot){
+        ACCOUNT_SNAPSHOT_READY = false;
+        showPendingView("Connect to the internet once to load this account's private workspace before using it on this device.");
+        return;
+      }
+      ACCOUNT_SNAPSHOT_READY = true;
     }
-    await Store.set(ACCOUNT_OWNER_KEY, fbUser.uid);
   }catch(e){
+    if(flowId!==AUTH_FLOW_ID || firebase.auth().currentUser?.uid!==fbUser.uid) return;
     console.error("Could not prepare account data:", e);
     showToast("Your account opened, but its cloud data could not be prepared on this device.", true);
+    const localSnapshot = await Store.get(STORAGE_KEY);
+    if(!localSnapshot){
+      showPendingView("Connect to the internet to load this account's private workspace. No other account's data will be used as a fallback.");
+      return;
+    }
   }
 
-  document.getElementById("authScreen").style.display = "none";
   const app = document.getElementById("appRoot");
-  app.classList.add("authed");
+  app.classList.remove("authed");
+  document.getElementById("authScreen").style.display = "flex";
   const line = document.getElementById("sidebarUserLine");
   if(line) line.innerHTML = `Signed in as <b style="color:#EAF0F6;">${esc(AUTH_SESSION.name || AUTH_SESSION.email)}</b>`;
-  await initApp();
+  const initialized = await initApp(fbUser.uid);
+  if(!initialized || flowId!==AUTH_FLOW_ID || firebase.auth().currentUser?.uid!==fbUser.uid) return;
+  document.getElementById("authScreen").style.display = "none";
+  app.classList.add("authed");
   if(typeof ATLASTour !== "undefined") ATLASTour.maybeOfferOnLogin();
   if(WELCOME_TOAST_MESSAGE){ showToast(WELCOME_TOAST_MESSAGE); WELCOME_TOAST_MESSAGE = null; }
 }
 
 firebase.auth().onAuthStateChanged(async (fbUser)=>{
+  const flowId = ++AUTH_FLOW_ID;
   try{
     if(fbUser){
-      await handleAuthenticatedUser(fbUser);
+      stopEmailVerificationWatcher();
+      document.getElementById("appRoot").classList.remove("authed");
+      document.getElementById("authScreen").style.display = "flex";
+      clearAccountState();
+      await handleAuthenticatedUser(fbUser,flowId);
     } else {
-      AUTH_SESSION = null;
+      stopEmailVerificationWatcher();
+      clearAccountState();
       closeInstallPrompt();
       document.getElementById("appRoot").classList.remove("authed");
       document.getElementById("authScreen").style.display = "flex";
@@ -7649,7 +7800,7 @@ document.getElementById("signupBtn").addEventListener("click", async ()=>{
     await cred.user.updateProfile({ displayName: name });
     await cred.user.sendEmailVerification();
     const nowIso = new Date().toISOString();
-    await createUserProfileDoc(cred.user.uid, { name, email, role:"pending", accountType:"email", verificationSentAt: nowIso, createdAt: nowIso, updatedAt: nowIso });
+    await createUserProfileDoc(cred.user.uid, { name, email:cred.user.email, role:"pending", accountType:"email", verificationSentAt: nowIso, createdAt: nowIso, updatedAt: nowIso });
     WELCOME_TOAST_MESSAGE = `Account created. Check ${email} to verify it.`;
   }catch(e){
     if(e.code==="auth/email-already-in-use"){ errEl.textContent = "An account with that email already exists. Try logging in instead."; setFieldError("signupEmail", true); }
@@ -7718,7 +7869,7 @@ document.getElementById("logoutBtn").addEventListener("click", ()=>{
     await saveData();
     if(navigator.onLine){
       await attemptSync(true);
-      const cloudSaved = await saveAccountSnapshot();
+      const cloudSaved = await saveAccountSnapshot(currentAdminId());
       if(!cloudSaved) showToast("Local data was saved, but the account database could not be reached. Please log in again when online to retry.", true);
     }else{
       showToast("You are offline. Local data was saved; cloud backup will happen after you reconnect and log in.", true);
