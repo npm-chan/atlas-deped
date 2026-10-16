@@ -85,6 +85,7 @@ const TRACK_LIST = ["TechPro", "ACADS", "Both"];
    ========================================================= */
 const SECTION_TYPES = ["Regular", "Special Program"];
 const SUBJECT_PROGRAMS = ["Regular", "Special Program"];
+let SECTION_SPECIAL_PROGRAMS = ["RFS", "ESPS"];
 // Shown in a period slot when a grade/section has no actual Subject records
 // configured yet for the current School Year/Term — NEVER a real subject
 // name, and never fed into teacher/schedule generation (see
@@ -281,10 +282,8 @@ function termIdByName(name){ const t = TERMS.find(t=>t.name===name); return t ? 
 let CURRENT_TERM_ID = TERMS[0].id;
 
 const SUBJECT_TYPES = ["Core","Specialized","Elective"];
-// fridayOnly: when true, this subject is only offered/scheduled on Friday
-// (e.g. clubs, values formation) and is excluded from the Mon–Thu rotation.
-// Defaults to false/undefined, meaning the subject is offered every active
-// school day (Mon–Thu, plus Friday when the Admin has enabled it).
+// fridayOnly: when true, the subject is scheduled on Friday exclusively.
+// Otherwise it follows its regular active-days / Days per Week schedule.
 const SUBJECTS = []; // {id, code, name, schoolYearId, termId, grade, strand, type, units, hoursPerWeek, status, fridayOnly}
 let subjectIdCounter = 1;
 
@@ -885,14 +884,30 @@ async function pullRemote(entityType){
   // Firestore's REST API has no "?field=gt.value" querystring filter like
   // PostgREST — the equivalent is a structured query POSTed to :runQuery.
   const url = firestoreBase()+":runQuery"+firestoreKeyQS();
+  const updatedAtFilter = { fieldFilter: {
+    field: { fieldPath: "updated_at" },
+    op: "GREATER_THAN",
+    value: { timestampValue: sinceVal }
+  }};
+  // Teachers/Sections are owned per-admin — the Security Rules only allow
+  // reading a doc whose createdBy == the caller's uid. Firestore rejects a
+  // list/runQuery request outright unless the query's own filters already
+  // guarantee every possible result would pass the rule, so this
+  // createdBy filter has to be here for the pull to be allowed at all.
+  // Subjects stays unfiltered — it's shared reference data every admin can read.
+  let where = updatedAtFilter;
+  if(entityType==="teachers" || entityType==="sections"){
+    const uid = typeof firebase!=="undefined" && firebase.auth().currentUser && firebase.auth().currentUser.uid;
+    if(!uid) return false; // not signed in yet — nothing this admin owns to pull
+    where = { compositeFilter: { op:"AND", filters: [
+      updatedAtFilter,
+      { fieldFilter: { field:{ fieldPath:"createdBy" }, op:"EQUAL", value:{ stringValue: uid } } }
+    ]}};
+  }
   const body = {
     structuredQuery: {
       from: [{ collectionId: table }],
-      where: { fieldFilter: {
-        field: { fieldPath: "updated_at" },
-        op: "GREATER_THAN",
-        value: { timestampValue: sinceVal }
-      }},
+      where,
       orderBy: [{ field: { fieldPath: "updated_at" }, direction: "ASCENDING" }]
     }
   };
@@ -1035,7 +1050,7 @@ function renderConnectionIndicator(){
   el.textContent = dot+" "+text;
 
   const parts = [NET_ONLINE ? "Device is online" : "Device is offline"];
-  parts.push(CLOUD_CONFIG.enabled ? ("Cloud: "+CLOUD_CONFIG.url) : "Cloud database not configured — changes stay on this device");
+  parts.push(CLOUD_CONFIG.enabled ? "Cloud sync enabled" : "Cloud database not configured — changes stay on this device");
   parts.push(LAST_SYNC_AT ? "Last sync: "+LAST_SYNC_AT.toLocaleString() : "Not synced yet");
   el.title = parts.join(" · ");
 }
@@ -1052,7 +1067,7 @@ function setSaveIndicator(state){
 function snapshotData(){
   return {
     teachersAll: TEACHERS_ALL,
-    sectionsAll: SECTIONS_ALL.map(s=>({id:s.id, grade:s.grade, name:s.name, strand:s.strand, roomId:s.roomId, sectionType:s.sectionType, classShift:s.classShift, createdBy:s.createdBy})),
+    sectionsAll: SECTIONS_ALL.map(s=>({id:s.id, grade:s.grade, name:s.name, strand:s.strand, roomId:s.roomId, sectionType:s.sectionType, specialProgram:s.specialProgram, adviserId:s.adviserId, classShift:s.classShift, createdBy:s.createdBy})),
     currentTerm: CURRENT_TERM,
     gradeConfig: GRADE_CONFIG,
     adminStart: ADMIN_START,
@@ -1063,8 +1078,11 @@ function snapshotData(){
     schoolLogo: SCHOOL_LOGO,
     teacherCounter, sectionCounter,
     scheduleAssignments: SCHEDULE_ASSIGNMENTS,
+    scheduleGradeConfig: SCHEDULE_GRADE_CONFIG,
     scheduleConflicts: SCHEDULE_CONFLICTS,
     scheduleGeneratedAt: SCHEDULE_GENERATED_AT,
+    finalScheduleValidatedAt: FINAL_SCHEDULE_VALIDATED_AT,
+    finalScheduleValidatedBy: FINAL_SCHEDULE_VALIDATED_BY,
     resolvedConflicts: RESOLVED_CONFLICTS,
     conflictHistory: CONFLICT_HISTORY,
     conflictHistoryIdCounter,
@@ -1089,6 +1107,7 @@ function snapshotData(){
     finalScheduleFinalizedAt: FINAL_SCHEDULE_FINALIZED_AT,
     finalScheduleFinalizedBy: FINAL_SCHEDULE_FINALIZED_BY,
     specialProgramSubjects: SPECIAL_PROGRAM_SUBJECTS,
+    sectionSpecialPrograms: SECTION_SPECIAL_PROGRAMS,
     scheduleDataVersion: 2
   };
 }
@@ -1136,6 +1155,10 @@ async function saveAccountSnapshot(){
     const accountSnapshot = snapshotData();
     accountSnapshot.teachersAll = accountSnapshot.teachersAll.filter(record=>!record.createdBy || record.createdBy===user.uid);
     accountSnapshot.sectionsAll = accountSnapshot.sectionsAll.filter(record=>!record.createdBy || record.createdBy===user.uid);
+    const ownedSectionIds = new Set(accountSnapshot.sectionsAll.map(section=>section.id));
+    accountSnapshot.scheduleGradeConfig = Object.fromEntries(
+      Object.entries(accountSnapshot.scheduleGradeConfig||{}).filter(([sectionId])=>ownedSectionIds.has(sectionId))
+    );
     const authHeader = await firestoreAuthHeader();
     const query = "?updateMask.fieldPaths=appData&updateMask.fieldPaths=appDataUpdatedAt" +
       (CLOUD_CONFIG.anonKey ? "&key="+encodeURIComponent(CLOUD_CONFIG.anonKey) : "");
@@ -1253,6 +1276,9 @@ function applySnapshot(data){
   SPECIAL_PROGRAM_SUBJECTS = (Array.isArray(data.specialProgramSubjects) && data.specialProgramSubjects.length)
     ? data.specialProgramSubjects
     : ["ICT", "RFS", "Research"];
+  SECTION_SPECIAL_PROGRAMS = Array.isArray(data.sectionSpecialPrograms) && data.sectionSpecialPrograms.length
+    ? Array.from(new Set(["RFS", "ESPS", ...data.sectionSpecialPrograms]))
+    : ["RFS", "ESPS"];
   // Edit Mode is a transient, in-session concept only — never resumes across a reload.
   FINAL_EDIT_MODE = false;
   FINAL_EDIT_SNAPSHOT = null;
@@ -1280,10 +1306,13 @@ function applySnapshot(data){
     });
   } else {
     SCHEDULE_ASSIGNMENTS = data.scheduleAssignments || {};
+    SCHEDULE_GRADE_CONFIG = data.scheduleGradeConfig || {};
     SECTION_PERIOD_OVERRIDE = data.sectionPeriodOverride || {};
   }
   SCHEDULE_CONFLICTS = data.scheduleConflicts || [];
   SCHEDULE_GENERATED_AT = data.scheduleGeneratedAt || null;
+  FINAL_SCHEDULE_VALIDATED_AT = data.finalScheduleValidatedAt || null;
+  FINAL_SCHEDULE_VALIDATED_BY = data.finalScheduleValidatedBy || null;
   RESOLVED_CONFLICTS = data.resolvedConflicts || [];
   CONFLICT_HISTORY = data.conflictHistory || [];
   conflictHistoryIdCounter = data.conflictHistoryIdCounter || (CONFLICT_HISTORY.length+1);
@@ -1402,12 +1431,12 @@ let SCHOOL_LOGO = ""; // data-URL (base64) of the uploaded school logo, editable
 // stagger by 15 minutes per level, matching the school's default pattern,
 // but the Admin can set any value per grade.
 const DEFAULT_CONFIG = {
-  "Grade 7": {startTime:"07:00", periods:9, periodLen:50, amBreakAt:100, amBreakLen:15, lunchAt:265, lunchLen:60, pmBreakAt:475, pmBreakLen:15},
-  "Grade 8": {startTime:"07:15", periods:9, periodLen:50, amBreakAt:110, amBreakLen:15, lunchAt:275, lunchLen:60, pmBreakAt:485, pmBreakLen:15},
-  "Grade 9": {startTime:"07:30", periods:9, periodLen:50, amBreakAt:120, amBreakLen:15, lunchAt:285, lunchLen:60, pmBreakAt:495, pmBreakLen:15},
-  "Grade 10":{startTime:"07:45", periods:9, periodLen:50, amBreakAt:130, amBreakLen:15, lunchAt:295, lunchLen:60, pmBreakAt:505, pmBreakLen:15},
-  "Grade 11":{startTime:"08:00", periods:8, periodLen:60, amBreakAt:120, amBreakLen:15, lunchAt:315, lunchLen:60, pmBreakAt:495, pmBreakLen:15},
-  "Grade 12":{startTime:"08:15", periods:8, periodLen:60, amBreakAt:130, amBreakLen:15, lunchAt:325, lunchLen:60, pmBreakAt:505, pmBreakLen:15}
+  "Grade 7": {startTime:"07:00", endTime:"16:00", periods:9, periodLen:50, amBreakAt:100, amBreakLen:15, lunchAt:265, lunchLen:60, pmBreakAt:475, pmBreakLen:15},
+  "Grade 8": {startTime:"07:15", endTime:"16:15", periods:9, periodLen:50, amBreakAt:110, amBreakLen:15, lunchAt:275, lunchLen:60, pmBreakAt:485, pmBreakLen:15},
+  "Grade 9": {startTime:"07:30", endTime:"16:30", periods:9, periodLen:50, amBreakAt:120, amBreakLen:15, lunchAt:285, lunchLen:60, pmBreakAt:495, pmBreakLen:15},
+  "Grade 10":{startTime:"07:45", endTime:"16:45", periods:9, periodLen:50, amBreakAt:130, amBreakLen:15, lunchAt:295, lunchLen:60, pmBreakAt:505, pmBreakLen:15},
+  "Grade 11":{startTime:"08:00", endTime:"17:30", periods:8, periodLen:60, amBreakAt:120, amBreakLen:15, lunchAt:315, lunchLen:60, pmBreakAt:495, pmBreakLen:15},
+  "Grade 12":{startTime:"08:15", endTime:"17:45", periods:8, periodLen:60, amBreakAt:130, amBreakLen:15, lunchAt:325, lunchLen:60, pmBreakAt:505, pmBreakLen:15}
 };
 let GRADE_CONFIG = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 
@@ -1428,6 +1457,7 @@ function migrateGradeConfig(raw){
       // schedule doesn't silently shift on upgrade, but a brand-new grade
       // config with no legacy value at all gets the staggered default.
       startTime: c.startTime!=null ? c.startTime : (raw._legacyStart || def.startTime),
+      endTime: c.endTime!=null ? c.endTime : def.endTime,
       periods: c.periods!=null ? c.periods : def.periods,
       periodLen: c.periodLen!=null ? c.periodLen : def.periodLen,
       amBreakAt: c.amBreakAt!=null ? c.amBreakAt : (c.breakAt!=null ? c.breakAt : def.amBreakAt),
@@ -1439,6 +1469,13 @@ function migrateGradeConfig(raw){
     };
   });
   return out;
+}
+function captureCurrentScheduleBellConfigs(){
+  SECTIONS.forEach(section=>{
+    if(!SCHEDULE_GRADE_CONFIG[section.id]){
+      SCHEDULE_GRADE_CONFIG[section.id]={...GRADE_CONFIG[section.grade],shsPmStart:SHS_PM_START};
+    }
+  });
 }
 
 /* =========================================================
@@ -1523,7 +1560,14 @@ function subjectsForSection(section, day){
     s.status==="Active" &&
     (!s.strand || s.strand===section.strand)
   );
-  const generatedScoped = day ? generatedAll.filter(s=> subjectAllowedOnDay(s, day)) : generatedAll;
+  let generatedScoped = day ? generatedAll.filter(s=> subjectAllowedOnDay(s, day)) : generatedAll;
+  if(day && section.sectionType==="Regular" && generatedAll.length>=2){
+    const lastTwo = generatedAll.slice(-2);
+    const first = lastTwo[0], second = lastTwo[1];
+    if(day==="Fri") generatedScoped = lastTwo;
+    else if(day==="Mon" || day==="Tue") generatedScoped = generatedScoped.filter(s=>s.id!==second.id);
+    else if(day==="Wed" || day==="Thu") generatedScoped = generatedScoped.filter(s=>s.id!==first.id);
+  }
   return generatedScoped.map(s=>s.name);
   // Nothing hard-coded here: if no Subject record exists yet for this exact
   // School Year/Term/Grade(/Strand), this simply returns an empty list.
@@ -1544,15 +1588,34 @@ function subjectScheduleDays(s){
   if(s.scheduleDays && ["mon-thu","mon-fri","friday-only"].includes(s.scheduleDays)) return s.scheduleDays;
   return s.fridayOnly ? "friday-only" : "mon-fri";
 }
+function subjectDaysPerWeek(s){
+  const weekLength = activeDays().length;
+  if(subjectScheduleDays(s)==="friday-only") return 1;
+  if(Number.isInteger(Number(s.daysPerWeek)) && Number(s.daysPerWeek)>0) return Math.min(Number(s.daysPerWeek), weekLength);
+  if(subjectScheduleDays(s)==="mon-thu") return Math.min(4, weekLength);
+  return weekLength;
+}
 function subjectAllowedOnDay(s, day){
   const sd = subjectScheduleDays(s);
-  if(day==="Fri") return sd!=="mon-thu";
-  return sd!=="friday-only";
+  if(day==="Fri") return FRIDAY_ENABLED && sd!=="mon-thu";
+  if(sd==="friday-only") return false;
+  if(sd==="mon-thu") return true;
+  const week = activeDays();
+  const count = subjectDaysPerWeek(s);
+  if(count>=week.length) return week.includes(day);
+  const dayIndexes = count===1
+    ? [Math.floor((week.length-1)/2)]
+    : Array.from({length:count}, (_,i)=>Math.round(i*(week.length-1)/(count-1)));
+  return dayIndexes.some(i=>week[i]===day);
 }
 function scheduleDaysLabel(sd){
   return sd==="mon-thu" ? '<span class="tag">Monday–Thursday</span>'
     : sd==="friday-only" ? '<span class="tag gold">Friday Only</span>'
     : '<span class="hint">Monday–Friday</span>';
+}
+function daysPerWeekLabel(s){
+  const count = subjectDaysPerWeek(s);
+  return `${count}${subjectScheduleDays(s)==="friday-only"?" (Friday only)":""}`;
 }
 
 // The Program ("Regular" / "Special Program") of a given subject NAME, as
@@ -1573,59 +1636,213 @@ function subjectProgramFor(subjectName, section){
 // with no explicit Program on record (subjectProgramFor === null) are
 // always considered compatible — there's nothing to enforce against.
 function programsCompatible(subjectName, section){
+  if(subjectName.includes(" + ")) return subjectName.split(" + ").every(name=>programsCompatible(name, section));
   const prog = subjectProgramFor(subjectName, section);
   if(prog==null) return true;
   return prog === (section.sectionType || "Regular");
 }
 
+function timelineSubjectsForSection(section, day){
+  let subjects = subjectsForSection(section, day);
+  const isEspsGrade10 = section.grade==="Grade 10" && section.sectionType==="Special Program" && section.specialProgram==="ESPS";
+  if(isEspsGrade10 && subjects.includes("TLE") && subjects.includes("Research")){
+    let paired = false;
+    subjects = subjects.reduce((list, subject)=>{
+      if(subject==="TLE" && !paired){ list.push("TLE + Research"); paired=true; }
+      else if(subject!=="Research") list.push(subject);
+      return list;
+    }, []);
+  }
+  return Array.from(new Set(subjects));
+}
+
+function sectionPeriodRotationOffset(section, subjects){
+  if(subjects.length<2) return 0;
+  const peers = SECTIONS.filter(candidate=>
+    candidate.grade===section.grade &&
+    (candidate.strand||"")===(section.strand||"") &&
+    (candidate.classShift||"None")===(section.classShift||"None")
+  );
+  const index = peers.findIndex(candidate=>candidate.id===section.id);
+  return index<0 ? 0 : index%subjects.length;
+}
+
 // Builds the full day timeline for a section WITHOUT assigning teachers yet:
 // array of blocks {type, start, end, subject?}. Purely a function of the
-// grade's bell-schedule config, admin start time, and the section's subject
-// list — deterministic, so it's safe to call any time.
+// grade's bell-schedule config, section subjects, and peer-section rotations.
+// It is deterministic for the current section list.
 function buildTimelineRaw(section, day){
   day = day || "Mon";
-  const cfg = GRADE_CONFIG[section.grade];
-  const subs = subjectsForSection(section, day);
+  const cfg = SCHEDULE_GRADE_CONFIG[section.id] || GRADE_CONFIG[section.grade];
+  const subs = timelineSubjectsForSection(section, day);
+  const regularFridayLastTwo = section.sectionType==="Regular" && day==="Fri" && FRIDAY_ENABLED && subjectsForSection(section, day).length>=2;
+  const periodsForDay = regularFridayLastTwo ? 2 : cfg.periods;
+  const rotationOffset = sectionPeriodRotationOffset(section, subs);
   const seq = [];
-  for(let i=0;i<cfg.periods;i++) seq.push(subs.length ? subs[i % subs.length] : NO_SUBJECT_PLACEHOLDER);
+  for(let i=0;i<periodsForDay;i++) seq.push(subs.length ? subs[(i+rotationOffset) % subs.length] : NO_SUBJECT_PLACEHOLDER);
 
   // Grade 11/12 PM-Class sections run the same period structure/durations
   // as their grade's normal bell config, just starting from the school's
   // SHS PM-shift boundary instead of that grade's normal (AM) start time.
   // AM-Class and None sections are unaffected.
   const effectiveStart = (isSHSGrade(section.grade) && section.classShift==="PM")
-    ? (SHS_PM_START || cfg.startTime || ADMIN_START)
+    ? (cfg.shsPmStart || SHS_PM_START || cfg.startTime || ADMIN_START)
     : (cfg.startTime || ADMIN_START);
   const startMin = toMinutes(effectiveStart);
+  const configuredWindow = toMinutes(cfg.endTime || cfg.startTime)-toMinutes(cfg.startTime || ADMIN_START);
+  const dayEnd = startMin + Math.max(0, configuredWindow);
   let cur = startMin, placed = 0, amBreakDone=false, lunchDone=false, pmBreakDone=false, pIdx=0;
   const timeline = [];
-  while(placed < cfg.periods){
+  while(placed < periodsForDay){
     const elapsed = cur - startMin;
     if(!amBreakDone && elapsed >= cfg.amBreakAt){
+      if(cur+cfg.amBreakLen>dayEnd) break;
       timeline.push({type:"break", subtype:"am", start:cur, end:cur+cfg.amBreakLen});
       cur += cfg.amBreakLen; amBreakDone = true; continue;
     }
     if(!lunchDone && elapsed >= cfg.lunchAt){
+      if(cur+cfg.lunchLen>dayEnd) break;
       timeline.push({type:"lunch", start:cur, end:cur+cfg.lunchLen});
       cur += cfg.lunchLen; lunchDone = true; continue;
     }
     if(!pmBreakDone && elapsed >= cfg.pmBreakAt){
+      if(cur+cfg.pmBreakLen>dayEnd) break;
       timeline.push({type:"break", subtype:"pm", start:cur, end:cur+cfg.pmBreakLen});
       cur += cfg.pmBreakLen; pmBreakDone = true; continue;
     }
     const dayOverride = SECTION_PERIOD_OVERRIDE[section.id] && SECTION_PERIOD_OVERRIDE[section.id][day];
     const subject = (dayOverride && dayOverride[pIdx]!==undefined) ? dayOverride[pIdx] : seq[pIdx];
-    const dur = durationForSubject(subject, cfg);
-    timeline.push({type:"period", start:cur, end:cur+dur, subject, periodIdx:pIdx, day});
+    const dur = regularFridayLastTwo ? 120 : durationForSubject(subject, cfg);
+    if(cur+dur>dayEnd) break;
+    const sharedSubjects = subject==="TLE + Research" ? ["TLE","Research"] : undefined;
+    timeline.push({type:"period", start:cur, end:cur+dur, subject, sharedSubjects, periodIdx:pIdx, day});
     cur += dur; placed++; pIdx++;
   }
   // Any break/lunch whose threshold was never reached during the period loop
   // (e.g. an Admin-set time beyond the last period) is still appended at the
   // end of the day, in am-break → lunch → pm-break order, so it's never lost.
-  if(!amBreakDone){ timeline.push({type:"break", subtype:"am", start:cur, end:cur+cfg.amBreakLen}); cur += cfg.amBreakLen; }
-  if(!lunchDone){ timeline.push({type:"lunch", start:cur, end:cur+cfg.lunchLen}); cur += cfg.lunchLen; }
-  if(!pmBreakDone){ timeline.push({type:"break", subtype:"pm", start:cur, end:cur+cfg.pmBreakLen}); cur += cfg.pmBreakLen; }
+  if(!amBreakDone && cur+cfg.amBreakLen<=dayEnd){ timeline.push({type:"break", subtype:"am", start:cur, end:cur+cfg.amBreakLen}); cur += cfg.amBreakLen; }
+  if(!lunchDone && cur+cfg.lunchLen<=dayEnd){ timeline.push({type:"lunch", start:cur, end:cur+cfg.lunchLen}); cur += cfg.lunchLen; }
+  if(!pmBreakDone && cur+cfg.pmBreakLen<=dayEnd){ timeline.push({type:"break", subtype:"pm", start:cur, end:cur+cfg.pmBreakLen}); cur += cfg.pmBreakLen; }
   return timeline;
+}
+
+function sectionClassEnd(section){
+  const cfg = SCHEDULE_GRADE_CONFIG[section.id] || GRADE_CONFIG[section.grade];
+  const normalStart = toMinutes(cfg.startTime || ADMIN_START);
+  const configuredEnd = toMinutes(cfg.endTime || cfg.startTime);
+  const effectiveStart = isSHSGrade(section.grade) && section.classShift==="PM"
+    ? toMinutes(cfg.shsPmStart || SHS_PM_START || cfg.startTime || ADMIN_START)
+    : normalStart;
+  return effectiveStart + Math.max(0, configuredEnd-normalStart);
+}
+
+function detectClassTimeLimitConflicts(sections, days){
+  const conflicts = [];
+  sections.forEach(section=>{
+    const cfg = SCHEDULE_GRADE_CONFIG[section.id] || GRADE_CONFIG[section.grade];
+    days.forEach(day=>{
+      const scheduled = buildTimelineRaw(section, day).filter(block=>block.type==="period").length;
+      const requiredPeriods=section.sectionType==="Regular"&&day==="Fri"&&FRIDAY_ENABLED&&subjectsForSection(section,day).length>=2?2:cfg.periods;
+      if(scheduled>=requiredPeriods) return;
+      const end = sectionClassEnd(section);
+      conflicts.push({
+        id:`TIMEWINDOW_${section.id}_${day}`,
+        type:"CLASS_TIME_CONFLICT",
+        severity:"high",
+        sectionLabel:section.grade+" - "+section.name,
+        section:section.id,
+        subject:null,
+        day,
+        start:end,
+        end,
+        reason:`The configured class end time does not leave enough time for the required ${requiredPeriods} periods`,
+        message:`${section.grade} - ${section.name} can fit only ${scheduled} of ${requiredPeriods} required periods on ${DAY_FULL_NAME[day]} before the class end time (${fmt(end)}). Increase the end time or adjust period lengths, breaks, or periods per day.`,
+        possibleSolutions:[
+          `Extend ${section.grade}'s Class End Time in Admin Settings`,
+          `Reduce period length, breaks, or periods per day for ${section.grade}`,
+          `Review subject duration overrides in Schedule Settings`
+        ],
+        affectedScheduleIds:[],
+        status:"OPEN"
+      });
+    });
+  });
+  return conflicts;
+}
+function detectSectionPeriodRotationConflicts(sections, days){
+  const conflicts=[];
+  days.forEach(day=>{
+    const timelines=new Map(sections.map(section=>[
+      section.id,
+      buildTimelineRaw(section,day).filter(block=>block.type==="period")
+    ]));
+    for(let i=0;i<sections.length;i++){
+      const first=sections[i];
+      for(let j=i+1;j<sections.length;j++){
+        const second=sections[j];
+        if(first.grade!==second.grade || (first.strand||"")!==(second.strand||"") ||
+           (first.classShift||"None")!==(second.classShift||"None")) continue;
+        const firstBlocks=timelines.get(first.id);
+        const secondBlocks=timelines.get(second.id);
+        const sharedPeriods=[];
+        for(let period=0;period<Math.min(firstBlocks.length,secondBlocks.length);period++){
+          const subject=firstBlocks[period].subject;
+          if(subject && subject!==NO_SUBJECT_PLACEHOLDER && subject===secondBlocks[period].subject){
+            sharedPeriods.push(period+1);
+          }
+        }
+        if(!sharedPeriods.length) continue;
+        const periodLabel=sharedPeriods.length===1 ? `period ${sharedPeriods[0]}` : `periods ${sharedPeriods.join(", ")}`;
+        conflicts.push({
+          id:`ROTATION_${first.id}_${second.id}_${day}`,
+          type:"SECTION_PERIOD_ROTATION_CONFLICT",
+          severity:"high",
+          sectionLabel:`${first.grade} - ${first.name} / ${second.name}`,
+          section:first.id,
+          subject:firstBlocks[sharedPeriods[0]-1].subject,
+          day,
+          start:null,
+          end:null,
+          reason:`The same subject is assigned to the same numbered period in multiple sections`,
+          message:`${first.grade} - ${first.name} and ${second.name} both have ${firstBlocks[sharedPeriods[0]-1].subject} in ${periodLabel} on ${DAY_FULL_NAME[day]}. Add or adjust subjects so each section can use a different subject order.`,
+          possibleSolutions:["Add or adjust subjects for this grade so sections can rotate across more distinct subjects","Review the subject list and regenerate the schedule"],
+          affectedScheduleIds:[],
+          status:"OPEN"
+        });
+      }
+    }
+  });
+  return conflicts;
+}
+function detectSpecialSubjectDayConflicts(sections, days){
+  const conflicts=[];
+  const expectedDays=days.includes("Fri")?3:2;
+  sections.forEach(section=>{
+    if(section.sectionType!=="Regular") return;
+    const records=SUBJECTS.filter(s=>s.schoolYearId===CURRENT_SCHOOL_YEAR_ID&&s.termId===CURRENT_TERM_ID&&s.grade===section.grade&&s.status==="Active"&&(!s.strand||s.strand===section.strand));
+    if(records.length<2) return;
+    records.slice(-2).forEach(subject=>{
+      if(!Number.isInteger(Number(subject.daysPerWeek))||Number(subject.daysPerWeek)===expectedDays) return;
+      conflicts.push({
+        id:`DAYRULE_${section.id}_${subject.id}`,
+        type:"SUBJECT_DAYS_CONFLICT",
+        severity:"medium",
+        sectionLabel:section.grade+" - "+section.name,
+        section:section.id,
+        subject:subject.name,
+        day:null,
+        start:null,
+        end:null,
+        reason:`${subject.name} is a designated final subject and must be scheduled ${expectedDays} days per week`,
+        message:`${subject.name} is one of the final two subjects for ${section.grade} - ${section.name}; the distribution rule schedules it on ${expectedDays} days per week, but its Days per Week setting is ${subject.daysPerWeek}.`,
+        possibleSolutions:[`Set ${subject.name} to ${expectedDays} Days per Week on the Subjects page`,`Change the subject ordering if a different subject should receive the final-subject rule`],
+        affectedScheduleIds:[],
+        status:"OPEN"
+      });
+    });
+  });
+  return conflicts;
 }
 
 // Builds the full day timeline for a section WITH teachers filled in from the
@@ -1667,7 +1884,10 @@ function buildTimeline(section, day){
    ========================================================= */
 let SCHEDULE_ASSIGNMENTS = {};   // "sectionId|periodIdx" -> teacherId
 let SCHEDULE_CONFLICTS = [];     // [{sectionLabel, subject, start, end, reason}]
+let SCHEDULE_GRADE_CONFIG = {};  // sectionId -> bell configuration used by the most recent generation
 let SCHEDULE_GENERATED_AT = null;
+let FINAL_SCHEDULE_VALIDATED_AT = null;
+let FINAL_SCHEDULE_VALIDATED_BY = null;
 let CURRENT_TERM = "1st Term";   // which term the current schedule was generated for
 // Section-level period->subject overrides written by the time-slot-swap
 // Auto-Fix strategy (and, in principle, by a future manual "move subject"
@@ -1693,7 +1913,8 @@ let CONFLICT_HISTORY = [];     // append-only audit trail: {id, detectedAt, sect
 let conflictHistoryIdCounter = 1;
 let activeConflictTab = "all";
 let SELECTED_CONFLICT_IDS = new Set(); // ids currently checked in the Schedule Conflicts list (All/Unresolved/Resolved)
-
+const CONFLICTS_PAGE_SIZE = 50;
+const conflictPageState = { list:0, autofix:0, history:0, changes:0 };
 function conflictRoomLabel(c){
   const section = SECTIONS.find(s=>s.id===c.section);
   if(!section || !section.roomId) return "—";
@@ -1707,12 +1928,16 @@ function conflictTypeLabel(c){
     : c.type==="PROGRAM_CONFLICT" ? "Program Conflict"
     : c.type==="TEACHER_SHIFT_CONFLICT" ? "Teacher Shift Conflict"
     : c.type==="AMPM_SHIFT_CONFLICT" ? "AM/PM Shift Conflict"
+    : c.type==="CLASS_TIME_CONFLICT" ? "Class Time Limit"
+    : c.type==="SECTION_PERIOD_ROTATION_CONFLICT" ? "Section Period Rotation"
+    : c.type==="SUBJECT_DAYS_CONFLICT" ? "Subject Days per Week"
     : c.type==="ROOM_CONFLICT" ? "Room Conflict"
     : (c.type || "Scheduling Conflict");
 }
 const CONFLICT_HIGH_SEVERITY_TYPES = new Set([
   "MISSING_QUALIFIED_TEACHER","TEACHING_LOAD_EXCEEDED","PROGRAM_CONFLICT",
-  "TEACHER_SHIFT_CONFLICT","AMPM_SHIFT_CONFLICT","ROOM_CONFLICT"
+  "TEACHER_SHIFT_CONFLICT","AMPM_SHIFT_CONFLICT","ROOM_CONFLICT","CLASS_TIME_CONFLICT",
+  "SECTION_PERIOD_ROTATION_CONFLICT","SUBJECT_DAYS_CONFLICT"
 ]);
 function logConflictHistory(entry){
   CONFLICT_HISTORY.unshift({ id:"CH"+(conflictHistoryIdCounter++), detectedAt: entry.detectedAt || new Date().toISOString(), ...entry });
@@ -1723,13 +1948,16 @@ function logConflictHistory(entry){
 // the prior schedule's conflict set entirely.
 function logConflictsDetected(conflicts){
   RESOLVED_CONFLICTS = [];
-  conflicts.forEach(c=>{
-    logConflictHistory({
-      detectedAt: new Date().toISOString(),
+  const detectedAt = new Date().toISOString();
+  const entries = conflicts.map(c=>({
+      id:"CH"+(conflictHistoryIdCounter++),
+      detectedAt,
       sectionLabel: c.sectionLabel, subject: c.subject, day: c.day,
       previous: "—", resolutionMethod: "—", action: "Detected", finalStatus: "Unresolved"
-    });
-  });
+    }));
+  // Preserve the same newest-first order as repeated unshift(), without
+  // shifting the full audit trail once per new conflict.
+  CONFLICT_HISTORY = entries.reverse().concat(CONFLICT_HISTORY);
 }
 // Moves a conflict out of the unresolved list into Resolved with the given
 // status/method, recording an audit trail entry.
@@ -1781,11 +2009,12 @@ function candidatesForJob(section, block, loadCount, gradeLoadUsed){
   // never be validly staffed here — no teacher reassignment fixes that, so
   // this is reported up front as a Program Conflict (see
   // classifyAndDescribeConflict) rather than a staffing gap.
-  if(!programsCompatible(block.subject, section)) return [];
+  const subjectNames = block.sharedSubjects || [block.subject];
+  if(!subjectNames.every(subject=>programsCompatible(subject, section))) return [];
   const shiftRestricted = isSHSGrade(section.grade) && section.classShift && section.classShift!=="None";
   const candidates = TEACHERS.filter(t=>
     t.tiers.includes(section.grade) &&
-    teacherCanTeach(t, block.subject) &&
+    subjectNames.every(subject=>teacherCanTeach(t, subject)) &&
     canTeacherTakeGradeLoad(t, section, block.subject, gradeLoadUsed) &&
     (!shiftRestricted || shiftsCompatible(teacherShiftFor(t, section.grade), section.classShift))
   ).map(t=>t.id);
@@ -1815,7 +2044,7 @@ function classifyAndDescribeConflict(section, block, candidates, jobsByTeacherSl
   // Program Conflict — the subject's Program (Regular / Special Program)
   // doesn't match this section's Section Type. No teacher reassignment or
   // time-slot move can fix a subject/section program mismatch.
-  if(!programsCompatible(block.subject, section)){
+  if(!(block.sharedSubjects||[block.subject]).every(subject=>programsCompatible(subject, section))){
     const subjProgram = subjectProgramFor(block.subject, section) || "Regular";
     const secProgram = section.sectionType || "Regular";
     return {
@@ -1948,32 +2177,41 @@ function detectRoomConflicts(){
       });
     });
   });
+  const roomById = new Map(ROOMS.map(room=>[room.id, room]));
   Object.entries(byRoom).forEach(([roomId, entries])=>{
-    for(let i=0;i<entries.length;i++){
-      for(let j=i+1;j<entries.length;j++){
-        const a = entries[i], b = entries[j];
-        if(a.section.id===b.section.id || a.day!==b.day) continue;
-        if(!intervalsOverlap(a.start,a.end,b.start,b.end)) continue;
-        const room = ROOMS.find(r=>r.id===roomId);
-        const dayName = DAY_FULL_NAME[a.day] || a.day;
-        const [firstSec, secondSec] = a.section.id < b.section.id ? [a,b] : [b,a];
-        conflicts.push({
-          id: "RMCF_"+roomId+"_"+a.day+"_"+firstSec.section.id+"_"+secondSec.section.id+"_"+firstSec.start,
-          type:"ROOM_CONFLICT", severity:"high",
-          sectionLabel: firstSec.section.grade+" - "+firstSec.section.name,
-          section: firstSec.section.id, subject: firstSec.subject, day: a.day, start: firstSec.start, end: firstSec.end,
-          reason: `${room?room.name:"This room"} is booked by two sections at the same time`,
-          message: `${room?room.name:"This room"} is shared by ${firstSec.section.grade} - ${firstSec.section.name} and ${secondSec.section.grade} - ${secondSec.section.name}, both meeting ${dayName} ${fmt(a.start)}–${fmt(a.end)}.`,
-          possibleSolutions: [
-            `Assign ${secondSec.section.grade} - ${secondSec.section.name} to a different room`,
-            `Set one section's Class Shift (AM/PM) so the two no longer overlap`,
-            `Adjust one section's bell schedule so the two no longer overlap`
-          ],
-          affectedScheduleIds: [scheduleKey(firstSec.section.id, a.day, firstSec.periodIdx), scheduleKey(secondSec.section.id, a.day, secondSec.periodIdx)],
-          status: "OPEN"
-        });
+    const byDay = new Map();
+    entries.forEach(entry=>{
+      if(!byDay.has(entry.day)) byDay.set(entry.day, []);
+      byDay.get(entry.day).push(entry);
+    });
+    const room = roomById.get(roomId);
+    byDay.forEach(dayEntries=>{
+      dayEntries.sort((a,b)=>a.start-b.start || a.end-b.end);
+      for(let i=0;i<dayEntries.length;i++){
+        for(let j=i+1;j<dayEntries.length && dayEntries[j].start<dayEntries[i].end;j++){
+          const a = dayEntries[i], b = dayEntries[j];
+          if(a.section.id===b.section.id) continue;
+          if(!intervalsOverlap(a.start,a.end,b.start,b.end)) continue;
+          const dayName = DAY_FULL_NAME[a.day] || a.day;
+          const [firstSec, secondSec] = a.section.id < b.section.id ? [a,b] : [b,a];
+          conflicts.push({
+            id: "RMCF_"+roomId+"_"+a.day+"_"+firstSec.section.id+"_"+secondSec.section.id+"_"+firstSec.start,
+            type:"ROOM_CONFLICT", severity:"high",
+            sectionLabel: firstSec.section.grade+" - "+firstSec.section.name,
+            section: firstSec.section.id, subject: firstSec.subject, day: a.day, start: firstSec.start, end: firstSec.end,
+            reason: `${room?room.name:"This room"} is booked by two sections at the same time`,
+            message: `${room?room.name:"This room"} is shared by ${firstSec.section.grade} - ${firstSec.section.name} and ${secondSec.section.grade} - ${secondSec.section.name}, both meeting ${dayName} ${fmt(a.start)}–${fmt(a.end)}.`,
+            possibleSolutions: [
+              `Assign ${secondSec.section.grade} - ${secondSec.section.name} to a different room`,
+              `Set one section's Class Shift (AM/PM) so the two no longer overlap`,
+              `Adjust one section's bell schedule so the two no longer overlap`
+            ],
+            affectedScheduleIds: [scheduleKey(firstSec.section.id, a.day, firstSec.periodIdx), scheduleKey(secondSec.section.id, a.day, secondSec.periodIdx)],
+            status: "OPEN"
+          });
+        }
       }
-    }
+    });
   });
   return conflicts;
 }
@@ -2069,7 +2307,7 @@ function runScheduleAssignment(jobs){
 //     - dayMode: "mon-thu" | "mon-fri" — a ONE-TIME override for this
 //       generation run only. It does not change the saved Friday Schedule
 //       setting in Admin Settings; omit it to use that saved setting.
-function generateSchedule(opts){
+async function generateSchedule(opts){
   opts = (typeof opts === "string") ? { term: opts } : (opts || {});
   if(opts.term){ CURRENT_TERM = opts.term; CURRENT_TERM_ID = termIdByName(opts.term); }
 
@@ -2083,6 +2321,9 @@ function generateSchedule(opts){
 
   const targetSections = gradeFilter ? SECTIONS.filter(s=>gradeFilter.has(s.grade)) : SECTIONS;
   const targetSectionIds = new Set(targetSections.map(s=>s.id));
+  targetSections.forEach(section=>{
+    SCHEDULE_GRADE_CONFIG[section.id]={...GRADE_CONFIG[section.grade],shsPmStart:SHS_PM_START};
+  });
 
   if(gradeFilter){
     Object.keys(SECTION_PERIOD_OVERRIDE).forEach(sid=>{ if(targetSectionIds.has(sid)) delete SECTION_PERIOD_OVERRIDE[sid]; });
@@ -2090,7 +2331,12 @@ function generateSchedule(opts){
     SECTION_PERIOD_OVERRIDE = {}; // full regenerate starts from the default rotation again
   }
 
-  const result = solveJobsBestEffort(collectScheduleJobs({ days, sections: targetSections }));
+  const result = await solveJobsBestEffort(collectScheduleJobs({ days, sections: targetSections }));
+  result.conflicts = result.conflicts.concat(
+    detectClassTimeLimitConflicts(targetSections, days),
+    detectSectionPeriodRotationConflicts(targetSections, days),
+    detectSpecialSubjectDayConflicts(targetSections, days)
+  );
 
   if(gradeFilter){
     // Scoped run: replace only the targeted sections' assignments/conflicts,
@@ -2108,6 +2354,8 @@ function generateSchedule(opts){
   SCHEDULE_CONFLICTS = SCHEDULE_CONFLICTS.filter(c=>c.type!=="ROOM_CONFLICT" && c.type!=="AMPM_SHIFT_CONFLICT")
     .concat(detectRoomConflicts(), detectShiftMisconfigurations());
   SCHEDULE_GENERATED_AT = new Date().toISOString();
+  FINAL_SCHEDULE_VALIDATED_AT = null;
+  FINAL_SCHEDULE_VALIDATED_BY = null;
   logConflictsDetected(SCHEDULE_CONFLICTS);
   return result;
 }
@@ -2143,7 +2391,7 @@ function targetedDisplacementRepair(result, maxMoves){
     // Structural conflicts (subject/section Program mismatch, or a bell
     // schedule that doesn't fit its AM/PM window) can never be solved by
     // reassigning a teacher — leave them as-is for Unsolved Conflicts.
-    if(c.type==="PROGRAM_CONFLICT" || c.type==="AMPM_SHIFT_CONFLICT"){ stillOpen.push(c); continue; }
+    if(c.type==="PROGRAM_CONFLICT" || c.type==="AMPM_SHIFT_CONFLICT" || c.type==="CLASS_TIME_CONFLICT" || c.type==="SECTION_PERIOD_ROTATION_CONFLICT" || c.type==="SUBJECT_DAYS_CONFLICT"){ stillOpen.push(c); continue; }
     if(moves >= maxMoves){ stillOpen.push(c); continue; }
     const section = SECTIONS.find(s=>s.id===c.section);
     const [ , , pIdxStr] = c.affectedScheduleIds[0].split("|");
@@ -2239,7 +2487,7 @@ function timeSlotSwapRepair(result, maxMoves){
     // Same structural-conflict guard as targetedDisplacementRepair above —
     // a Program mismatch or AM/PM window overflow can't be fixed by moving
     // subjects between periods either.
-    if(c.type==="PROGRAM_CONFLICT" || c.type==="AMPM_SHIFT_CONFLICT"){ stillOpen.push(c); continue; }
+    if(c.type==="PROGRAM_CONFLICT" || c.type==="AMPM_SHIFT_CONFLICT" || c.type==="CLASS_TIME_CONFLICT" || c.type==="SECTION_PERIOD_ROTATION_CONFLICT" || c.type==="SUBJECT_DAYS_CONFLICT"){ stillOpen.push(c); continue; }
     if(moves >= maxMoves){ stillOpen.push(c); continue; }
     const section = SECTIONS.find(s=>s.id===c.section);
     const day = c.day;
@@ -2331,25 +2579,31 @@ function timeSlotSwapRepair(result, maxMoves){
 // both generateSchedule() (so a fresh generate already tries hard to come
 // back conflict-free) and autoFixConflicts() (to repair a schedule that's
 // already saved with conflicts in it).
-function solveJobsBestEffort(jobs){
+async function solveJobsBestEffort(jobs){
   let best = runScheduleAssignment(jobs);
+  await delay(0);
 
   function tryOrder(js){
     const result = runScheduleAssignment(js);
     if(result.conflicts.length < best.conflicts.length) best = result;
   }
 
-  const constrained = jobs.slice().sort((a,b)=>
-    candidatesForJob(a.section,a.block,{}).length - candidatesForJob(b.section,b.block,{}).length
-  );
+  const constrained = jobs.map((job,index)=>({
+    job,
+    index,
+    candidateCount:candidatesForJob(job.section,job.block,{}).length
+  })).sort((a,b)=>a.candidateCount-b.candidateCount || a.index-b.index).map(item=>item.job);
   tryOrder(constrained);
+  await delay(0);
 
   const tierPriority = { SHS:0, JHS:1 };
-  const byTier = jobs.slice().sort((a,b)=> tierPriority[a.section.tier]-tierPriority[b.section.tier]);
+  const byTier = jobs.slice().sort((a,b)=>tierPriority[a.section.tier]-tierPriority[b.section.tier]);
   tryOrder(byTier);
+  await delay(0);
 
   for(let i=0; i<25 && best.conflicts.length>0; i++){
     tryOrder(shuffledCopy(jobs));
+    await delay(0);
   }
 
   // Layer 2: targeted teacher-displacement repair on whatever's left.
@@ -2370,13 +2624,13 @@ function solveJobsBestEffort(jobs){
   return repaired;
 }
 
-function autoFixConflicts(){
+async function autoFixConflicts(){
   const before = SCHEDULE_CONFLICTS.length;
   if(before===0) return { before:0, after:0, changed:false, changes:[], detected:0, fixed:0, remaining:0, remainingConflicts:[] };
 
   const originalAssignments = JSON.parse(JSON.stringify(SCHEDULE_ASSIGNMENTS));
   const baseJobs = collectScheduleJobs();
-  const repaired = solveJobsBestEffort(baseJobs);
+  const repaired = await solveJobsBestEffort(baseJobs);
 
   // Diff final assignment map against the pre-autofix state for the
   // "Changes Made" panel (covers changes from every layer above).
@@ -2425,6 +2679,8 @@ function autoFixConflicts(){
   SCHEDULE_ASSIGNMENTS = repaired.assignmentMap;
   SCHEDULE_CONFLICTS = finalConflicts;
   SCHEDULE_GENERATED_AT = new Date().toISOString();
+  FINAL_SCHEDULE_VALIDATED_AT = null;
+  FINAL_SCHEDULE_VALIDATED_BY = null;
   return { before, after: remaining, changed, changes, detected, fixed, remaining, remainingConflicts: finalConflicts };
 }
 
@@ -2524,15 +2780,25 @@ function openTermPicker(onConfirm){
 }
 
 function runGenerateSchedule(){
+  const missingSections = SECTIONS.length===0;
+  const missingSubjects = SUBJECTS.length===0;
+  if(missingSections || missingSubjects){
+    const missing = missingSections && missingSubjects
+      ? "Sections and Subjects"
+      : missingSections ? "Sections" : "Subjects";
+    openConfirm(`<b>Missing Scheduling Data</b><br><br>Please create at least one ${missing} before using Auto-Generate Schedule.`, ()=>{}, "Close");
+    return;
+  }
   openConfirm("Regenerating the schedule may replace existing auto-generated assignments for the grade levels and days you select next. Your manually-added or manually-edited entries are protected and will not be overwritten. Do you want to continue?", ()=>{
     openTermPicker(async ({ term, grades, dayMode })=>{
-      const { assignmentMap, conflicts } = generateSchedule({ term, grades, dayMode });
+      const { assignmentMap, conflicts } = await generateSchedule({ term, grades, dayMode });
       LAST_CHANGES = [];
       LAST_AUTOFIX_SNAPSHOT = null;
       const resultWrap = document.getElementById("autoFixResultWrap");
       if(resultWrap){ resultWrap.style.display = "none"; resultWrap.innerHTML = ""; }
       await saveData();
       renderAll();
+      navigateTo("schedule");
       const total = Object.keys(assignmentMap).length;
       const scopeLabel = grades ? `${grades.length===1?grades[0]:grades.length+" selected grade levels"}` : "all grade levels";
       const msg = conflicts.length
@@ -2554,10 +2820,8 @@ const AUTOFIX_STEPS = [
 function delay(ms){ return new Promise(res=>setTimeout(res, ms)); }
 let LAST_CHANGES = [];
 
-// Runs Auto-Fix without freezing the UI: each "step" is painted, then we
-// yield back to the browser (setTimeout) before the next, so the page stays
-// responsive throughout — the actual solve happens synchronously in one of
-// those yields since it's fast, but the interface never blocks mid-step.
+// Yields between solver passes so progress updates paint and the UI stays
+// responsive while Auto-Fix explores alternate assignment orders.
 async function runAutoFixConflicts(){
   if(SCHEDULE_CONFLICTS.length===0){ showToast("No conflicts to fix — the schedule is already conflict-free."); return; }
 
@@ -2571,14 +2835,20 @@ async function runAutoFixConflicts(){
   if(wrap) wrap.style.display = "block";
 
   let result;
-  for(let i=0;i<AUTOFIX_STEPS.length;i++){
-    if(text) text.textContent = AUTOFIX_STEPS[i];
-    await delay(220);
-    if(i===AUTOFIX_STEPS.length-2) result = autoFixConflicts(); // solve just before "Validating solution…"
+  try{
+    for(let i=0;i<AUTOFIX_STEPS.length;i++){
+      if(text) text.textContent = AUTOFIX_STEPS[i];
+      await delay(220);
+      if(i===AUTOFIX_STEPS.length-2) result = await autoFixConflicts(); // solve just before "Validating solution…"
+    }
+  }catch(err){
+    console.error("Auto-Fix failed:", err);
+    showToast("Auto-Fix could not complete. See the browser console for details.", true);
+    return;
+  }finally{
+    if(wrap) wrap.style.display = "none";
+    [btn, btnT].forEach(b=>{ if(b){ b.disabled = false; b.style.opacity = 1; } });
   }
-
-  if(wrap) wrap.style.display = "none";
-  [btn, btnT].forEach(b=>{ if(b){ b.disabled = false; b.style.opacity = 1; } });
 
   const { before, after, changes, detected, fixed, remaining } = result;
   LAST_CHANGES = changes;
@@ -2612,12 +2882,18 @@ function renderChangesPanel(){
   const panel = document.getElementById("changesPanel");
   const hint = document.getElementById("changesHint");
   const body = document.getElementById("changesBody");
+  const pagination = document.getElementById("changesPagination");
   const undoBtn = document.getElementById("undoAutoFixBtn");
   if(!panel) return;
-  if(!LAST_CHANGES || LAST_CHANGES.length===0){ panel.style.display = "none"; return; }
+  if(!LAST_CHANGES || LAST_CHANGES.length===0){
+    panel.style.display = "none";
+    if(pagination) pagination.innerHTML = "";
+    return;
+  }
   panel.style.display = "block";
   hint.textContent = `${LAST_CHANGES.length} schedule record${LAST_CHANGES.length===1?'':'s'} changed by the most recent Auto-Fix run.`;
-  body.innerHTML = LAST_CHANGES.map(c=>{
+  const page = conflictPage(LAST_CHANGES, "changes");
+  body.innerHTML = page.rows.map(c=>{
     const oldT = c.fromTeacher ? teacherById(c.fromTeacher) : null;
     const newT = c.toTeacher ? teacherById(c.toTeacher) : null;
     const change = oldT
@@ -2625,6 +2901,7 @@ function renderChangesPanel(){
       : `Newly assigned: ${newT ? newT.name : "Unassigned"}`;
     return `<tr><td>${c.sectionLabel}</td><td>${c.subject}</td><td>${c.start!=null?fmt(c.start)+" – "+fmt(c.end):""}</td><td>${change}</td></tr>`;
   }).join("");
+  renderConflictPagination("changesPagination", "changes", LAST_CHANGES.length, page.page, page.pageCount);
   if(undoBtn){
     undoBtn.style.display = LAST_AUTOFIX_SNAPSHOT ? "inline-block" : "none";
     undoBtn.onclick = async ()=>{
@@ -2643,13 +2920,15 @@ function renderChangesPanel(){
 }
 
 // ---- Manual resolution for a conflict Auto-Fix couldn't close -------------
-// Structural conflicts (Program mismatch, AM/PM window overflow, Room
-// double-booking) have no "pick a different teacher" fix — the real fix is
-// an Admin editing the Section/Subject/Room configuration itself. Shown as
+// Structural conflicts have no "pick a different teacher" fix — the real fix
+// is an Admin editing the Section/Subject/Room configuration itself. Shown as
 // a guidance modal instead of the teacher-assignment picker below.
 function openStructuralConflictModal(c){
   const section = SECTIONS.find(s=>s.id===c.section);
   const editAction = c.type==="PROGRAM_CONFLICT" ? { label:"Edit Subject", fn:()=>{ closeModal(); navigateTo("subjects"); } }
+    : c.type==="SUBJECT_DAYS_CONFLICT" ? { label:"Edit Subject", fn:()=>{ closeModal(); navigateTo("subjects"); } }
+    : c.type==="SECTION_PERIOD_ROTATION_CONFLICT" ? { label:"Review Subjects", fn:()=>{ closeModal(); navigateTo("subjects"); } }
+    : c.type==="CLASS_TIME_CONFLICT" ? { label:"Edit Bell Settings", fn:()=>{ closeModal(); navigateTo("settings"); } }
     : c.type==="ROOM_CONFLICT" ? { label:"Edit Section", fn:()=>{ closeModal(); if(section) openSectionForm(section.id); } }
     : { label:"Edit Section", fn:()=>{ closeModal(); if(section) openSectionForm(section.id); } };
   document.getElementById("modalRoot").innerHTML = `
@@ -2675,7 +2954,7 @@ function openStructuralConflictModal(c){
 function openManualFixModal(conflictId){
   const c = SCHEDULE_CONFLICTS.find(x=>x.id===conflictId);
   if(!c) return;
-  if(c.type==="PROGRAM_CONFLICT" || c.type==="AMPM_SHIFT_CONFLICT" || c.type==="ROOM_CONFLICT"){
+  if(c.type==="PROGRAM_CONFLICT" || c.type==="AMPM_SHIFT_CONFLICT" || c.type==="ROOM_CONFLICT" || c.type==="CLASS_TIME_CONFLICT" || c.type==="SECTION_PERIOD_ROTATION_CONFLICT" || c.type==="SUBJECT_DAYS_CONFLICT"){
     openStructuralConflictModal(c);
     return;
   }
@@ -2797,32 +3076,57 @@ function renderConflicts(){
     navBadge.textContent = n;
   }
 
-  // Auto-Fix tab's own unresolved-conflicts table (unchanged behavior).
-  const panel = document.getElementById("conflictsPanel");
-  const body = document.getElementById("conflictsBody");
-  if(panel && body){
-    body.innerHTML = SCHEDULE_CONFLICTS.map(c=>{
-      const typeLabel = conflictTypeLabel(c);
-      const typeTag = CONFLICT_HIGH_SEVERITY_TYPES.has(c.type) ? "maroon" : "gold";
-      return `<tr>
-        <td>${c.sectionLabel}</td>
-        <td>${c.subject}</td>
-        <td>${fmt(c.start)} – ${fmt(c.end)}</td>
-        <td><span class="tag ${typeTag}">${typeLabel}</span></td>
-        <td style="max-width:340px;">
-          <div>${c.message}</div>
-          ${c.possibleSolutions && c.possibleSolutions.length ? `<ul style="margin:6px 0 0; padding-left:18px; color:var(--ink-soft); font-size:12px;">${c.possibleSolutions.slice(0,3).map(s=>`<li>${s}</li>`).join("")}</ul>` : ''}
-        </td>
-        <td><span class="tag maroon">${c.status||'UNRESOLVED'}</span></td>
-        <td style="display:flex; gap:6px;">
-          <button class="icon-btn" onclick="openManualFixModal('${c.id}')">Fix Manually</button>
-          <button class="icon-btn" onclick="ignoreConflict('${c.id}')">Ignore</button>
-        </td>
-      </tr>`;
-    }).join("") || `<tr><td colspan="7" class="empty">No unresolved conflicts.</td></tr>`;
-  }
   renderChangesPanel();
   renderConflictManagementPage();
+}
+
+function conflictPage(items, key){
+  const pageCount = Math.max(1, Math.ceil(items.length/CONFLICTS_PAGE_SIZE));
+  conflictPageState[key] = Math.min(conflictPageState[key], pageCount-1);
+  const start = conflictPageState[key]*CONFLICTS_PAGE_SIZE;
+  return { rows:items.slice(start, start+CONFLICTS_PAGE_SIZE), start, page:conflictPageState[key], pageCount };
+}
+function renderConflictPagination(containerId, key, total, page, pageCount){
+  const container = document.getElementById(containerId);
+  if(!container) return;
+  if(total<=CONFLICTS_PAGE_SIZE){
+    container.innerHTML = "";
+    return;
+  }
+  const first = page*CONFLICTS_PAGE_SIZE+1;
+  const last = Math.min(total, first+CONFLICTS_PAGE_SIZE-1);
+  container.innerHTML = `
+    <span class="hint">Showing ${first}–${last} of ${total}</span>
+    <div class="row-flex" style="gap:8px;">
+      <button class="icon-btn" data-conflict-page="${key}" data-step="-1" ${page===0?"disabled":""}>Previous</button>
+      <span class="hint">Page ${page+1} of ${pageCount}</span>
+      <button class="icon-btn" data-conflict-page="${key}" data-step="1" ${page>=pageCount-1?"disabled":""}>Next</button>
+    </div>`;
+}
+function renderAutoFixConflictTable(){
+  const body = document.getElementById("conflictsBody");
+  if(!body) return;
+  const page = conflictPage(SCHEDULE_CONFLICTS, "autofix");
+  body.innerHTML = page.rows.map(c=>{
+    const typeLabel = conflictTypeLabel(c);
+    const typeTag = CONFLICT_HIGH_SEVERITY_TYPES.has(c.type) ? "maroon" : "gold";
+    return `<tr>
+      <td>${c.sectionLabel}</td>
+      <td>${c.subject}</td>
+      <td>${fmt(c.start)} – ${fmt(c.end)}</td>
+      <td><span class="tag ${typeTag}">${typeLabel}</span></td>
+      <td style="max-width:340px;">
+        <div>${c.message}</div>
+        ${c.possibleSolutions && c.possibleSolutions.length ? `<ul style="margin:6px 0 0; padding-left:18px; color:var(--ink-soft); font-size:12px;">${c.possibleSolutions.slice(0,3).map(s=>`<li>${s}</li>`).join("")}</ul>` : ''}
+      </td>
+      <td><span class="tag maroon">${c.status||'UNRESOLVED'}</span></td>
+      <td style="display:flex; gap:6px;">
+        <button class="icon-btn" onclick="openManualFixModal('${c.id}')">Fix Manually</button>
+        <button class="icon-btn" onclick="ignoreConflict('${c.id}')">Ignore</button>
+      </td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="empty">No unresolved conflicts.</td></tr>`;
+  renderConflictPagination("conflictsPagination", "autofix", SCHEDULE_CONFLICTS.length, page.page, page.pageCount);
 }
 
 /* ---- Schedule Conflict Management page: tabs, All/Unresolved/Resolved
@@ -2853,7 +3157,8 @@ function conflictRowHtml(c, isResolved){
 }
 function renderConflictManagementPage(){
   const tabsWrap = document.getElementById("conflictTabs");
-  if(!tabsWrap) return; // page not built yet (shouldn't happen)
+  const pageElement = document.getElementById("page-conflicts");
+  if(!tabsWrap || !pageElement || !pageElement.classList.contains("active")) return;
 
   document.getElementById("ctabCountAll").textContent = "(" + (SCHEDULE_CONFLICTS.length + RESOLVED_CONFLICTS.length) + ")";
   document.getElementById("ctabCountUnresolved").textContent = "(" + SCHEDULE_CONFLICTS.length + ")";
@@ -2874,34 +3179,39 @@ function renderConflictManagementPage(){
   if(listView.style.display==="block"){
     const titleEl = document.getElementById("cmgmtListTitle");
     const hintEl = document.getElementById("cmgmtListHint");
-    let rows = [];
+    let allTabConflicts = [];
     if(activeConflictTab==="all"){
       titleEl.textContent = "All Conflicts";
       hintEl.textContent = "Every scheduling problem detected for the current schedule, whether still open or already resolved.";
-      currentIds = SCHEDULE_CONFLICTS.map(c=>c.id).concat(RESOLVED_CONFLICTS.map(c=>c.id));
-      rows = SCHEDULE_CONFLICTS.map(c=>conflictRowHtml(c,false)).concat(RESOLVED_CONFLICTS.map(c=>conflictRowHtml(c,true)));
+      allTabConflicts = SCHEDULE_CONFLICTS.concat(RESOLVED_CONFLICTS);
     } else if(activeConflictTab==="unresolved"){
       titleEl.textContent = "Unresolved Conflicts";
       hintEl.textContent = "Conflicts that could not be automatically resolved and still need attention. This never blocks Class Schedule — you can keep editing schedules normally.";
-      currentIds = SCHEDULE_CONFLICTS.map(c=>c.id);
-      rows = SCHEDULE_CONFLICTS.map(c=>conflictRowHtml(c,false));
+      allTabConflicts = SCHEDULE_CONFLICTS;
     } else {
       titleEl.textContent = "Resolved Conflicts";
       hintEl.textContent = "Conflicts that were Auto-Fixed, Manually Resolved, or Ignored.";
-      currentIds = RESOLVED_CONFLICTS.map(c=>c.id);
-      rows = RESOLVED_CONFLICTS.map(c=>conflictRowHtml(c,true));
+      allTabConflicts = RESOLVED_CONFLICTS;
     }
-    // Drop any selected id that's no longer visible in this tab (e.g. it was
-    // resolved/deleted elsewhere, or the admin switched tabs) so the counter
-    // and Select All checkbox always reflect what's actually on screen.
-    const currentIdSet = new Set(currentIds);
+    const allTabIds = allTabConflicts.map(conflict=>conflict.id);
+    const paged = conflictPage(allTabConflicts, "list");
+    currentIds = paged.rows.map(conflict=>conflict.id);
+    // Keep selections across pages but drop records no longer in this tab.
+    const currentIdSet = new Set(allTabIds);
     Array.from(SELECTED_CONFLICT_IDS).forEach(id=>{ if(!currentIdSet.has(id)) SELECTED_CONFLICT_IDS.delete(id); });
-    document.getElementById("cmgmtListBody").innerHTML = rows.join("") || `<tr><td colspan="12" class="empty">No conflicts to show.</td></tr>`;
-    renderConflictSelectionToolbar(currentIds);
+    document.getElementById("cmgmtListBody").innerHTML = paged.rows.map((conflict,index)=>{
+      const isResolved = activeConflictTab==="resolved" || (activeConflictTab==="all" && paged.start+index>=SCHEDULE_CONFLICTS.length);
+      return conflictRowHtml(conflict,isResolved);
+    }).join("") || `<tr><td colspan="12" class="empty">No conflicts to show.</td></tr>`;
+    renderConflictPagination("cmgmtListPagination", "list", allTabConflicts.length, paged.page, paged.pageCount);
+    renderConflictSelectionToolbar(currentIds, allTabIds);
   }
 
+  if(activeConflictTab==="autofix") renderAutoFixConflictTable();
+
   if(historyView.style.display==="block"){
-    document.getElementById("cmgmtHistoryBody").innerHTML = CONFLICT_HISTORY.map(h=>`<tr>
+    const paged = conflictPage(CONFLICT_HISTORY, "history");
+    document.getElementById("cmgmtHistoryBody").innerHTML = paged.rows.map(h=>`<tr>
       <td>${new Date(h.detectedAt).toLocaleString()}</td>
       <td>${h.sectionLabel||"—"}</td>
       <td>${h.subject||"—"}</td>
@@ -2910,35 +3220,51 @@ function renderConflictManagementPage(){
       <td>${h.action||"—"}</td>
       <td><span class="tag ${h.finalStatus==='Unresolved'?'maroon':''}">${h.finalStatus||"—"}</span></td>
     </tr>`).join("") || `<tr><td colspan="7" class="empty">No conflict history yet.</td></tr>`;
+    renderConflictPagination("cmgmtHistoryPagination", "history", CONFLICT_HISTORY.length, paged.page, paged.pageCount);
   }
 }
 document.addEventListener("click", (e)=>{
   const tabBtn = e.target.closest("#conflictTabs button[data-ctab]");
-  if(tabBtn){ activeConflictTab = tabBtn.dataset.ctab; renderConflictManagementPage(); }
+  if(tabBtn){
+    activeConflictTab = tabBtn.dataset.ctab;
+    if(activeConflictTab==="all" || activeConflictTab==="unresolved" || activeConflictTab==="resolved") conflictPageState.list = 0;
+    renderConflictManagementPage();
+  }
+  const pageBtn = e.target.closest("button[data-conflict-page]");
+  if(pageBtn && !pageBtn.disabled){
+    const key = pageBtn.dataset.conflictPage;
+    conflictPageState[key] = Math.max(0, conflictPageState[key]+Number(pageBtn.dataset.step));
+    if(key==="changes") renderChangesPanel();
+    else renderConflictManagementPage();
+  }
 });
-// Reflects the current selection (scoped to whatever's actually visible in
-// the active tab) into the counter text, the two bulk-action buttons'
-// disabled state, and the header Select All checkbox (including its
-// indeterminate state when only some visible rows are checked).
-function renderConflictSelectionToolbar(currentIds){
+// Reflects selections across the active tab while Select All applies only to
+// the currently visible page.
+function conflictIdsForActiveTab(){
+  if(activeConflictTab==="unresolved") return SCHEDULE_CONFLICTS.map(c=>c.id);
+  if(activeConflictTab==="resolved") return RESOLVED_CONFLICTS.map(c=>c.id);
+  return SCHEDULE_CONFLICTS.map(c=>c.id).concat(RESOLVED_CONFLICTS.map(c=>c.id));
+}
+function renderConflictSelectionToolbar(currentIds, selectableIds=currentIds){
   const countEl = document.getElementById("cmgmtSelectionCount");
   const clearBtn = document.getElementById("cmgmtClearSelectedBtn");
   const deleteBtn = document.getElementById("cmgmtDeleteSelectedBtn");
   const selectAll = document.getElementById("cmgmtSelectAll");
   if(!countEl || !clearBtn || !deleteBtn || !selectAll) return;
-  const n = currentIds.filter(id=>SELECTED_CONFLICT_IDS.has(id)).length;
+  const n = selectableIds.filter(id=>SELECTED_CONFLICT_IDS.has(id)).length;
   countEl.textContent = `${n} conflict${n===1?'':'s'} selected`;
   clearBtn.disabled = n===0;
   deleteBtn.disabled = n===0;
-  selectAll.checked = currentIds.length>0 && n===currentIds.length;
-  selectAll.indeterminate = n>0 && n<currentIds.length;
+  const visibleSelected = currentIds.filter(id=>SELECTED_CONFLICT_IDS.has(id)).length;
+  selectAll.checked = currentIds.length>0 && visibleSelected===currentIds.length;
+  selectAll.indeterminate = visibleSelected>0 && visibleSelected<currentIds.length;
 }
 document.addEventListener("change", (e)=>{
   if(e.target && e.target.classList && e.target.classList.contains("cmgmt-row-check")){
     const id = e.target.dataset.cid;
     if(e.target.checked) SELECTED_CONFLICT_IDS.add(id); else SELECTED_CONFLICT_IDS.delete(id);
     const currentIds = Array.from(document.querySelectorAll("#cmgmtListBody .cmgmt-row-check")).map(cb=>cb.dataset.cid);
-    renderConflictSelectionToolbar(currentIds);
+    renderConflictSelectionToolbar(currentIds, conflictIdsForActiveTab());
   }
   if(e.target && e.target.id==="cmgmtSelectAll"){
     const boxes = Array.from(document.querySelectorAll("#cmgmtListBody .cmgmt-row-check"));
@@ -2946,7 +3272,7 @@ document.addEventListener("change", (e)=>{
       cb.checked = e.target.checked;
       if(e.target.checked) SELECTED_CONFLICT_IDS.add(cb.dataset.cid); else SELECTED_CONFLICT_IDS.delete(cb.dataset.cid);
     });
-    renderConflictSelectionToolbar(boxes.map(cb=>cb.dataset.cid));
+    renderConflictSelectionToolbar(boxes.map(cb=>cb.dataset.cid), conflictIdsForActiveTab());
   }
 });
 document.addEventListener("click", (e)=>{
@@ -3405,6 +3731,8 @@ function deleteTeacher(id){
   if(!t) return;
   if(!assertOwned(t, "delete")) return;
   openConfirm(`Delete <b>${t.name}</b> from the faculty roster? Their generated schedule assignments will be cleared.`, async ()=>{
+    const advisedSections = SECTIONS.filter(s=>s.adviserId===id);
+    advisedSections.forEach(s=>{ delete s.adviserId; });
     const idx = TEACHERS_ALL.findIndex(x=>x.id===id);
     if(idx>-1) TEACHERS_ALL.splice(idx,1);
     refreshOwnedViews();
@@ -3417,6 +3745,7 @@ function deleteTeacher(id){
     });
     await saveData();
     await persistEntityChange("teachers", {id}, "DELETE");
+    for(const section of advisedSections) await persistEntityChange("sections", section, "UPDATE");
     renderAll();
     showToast("Teacher deleted. Regenerate the schedule to reassign their vacated periods.");
   });
@@ -3428,6 +3757,7 @@ function openSectionForm(existingId){
   if(existing && !assertOwned(existing, "edit")) return;
   const isEdit = !!existing;
   const esc = s => (s||"").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
+  const specialProgramOptions = Array.from(new Set([...SECTION_SPECIAL_PROGRAMS, ...(existing&&existing.specialProgram?[existing.specialProgram]:[])]));
   document.getElementById("modalRoot").innerHTML = `
     <div class="modal-backdrop" id="sectionBackdrop">
       <div class="modal-box">
@@ -3448,6 +3778,29 @@ function openSectionForm(existingId){
           <label class="field">Section Type
             <select id="sSectionType">${SECTION_TYPES.map(t=>`<option ${(isEdit?existing.sectionType:'Regular')===t?'selected':''}>${t}</option>`).join("")}</select>
             <span class="hint">Special Program sections may only be scheduled Special Program subjects, and vice versa.</span>
+          </label>
+          <label class="field" id="sSpecialProgramField" style="display:${isEdit&&existing.sectionType==="Special Program"?'flex':'none'};">Special Program
+            <select id="sSpecialProgram">
+              <option value="">— Select Program —</option>
+              ${specialProgramOptions.map(p=>`<option value="${esc(p)}" ${isEdit&&existing.specialProgram===p?'selected':''}>${esc(p)}</option>`).join("")}
+              <option value="__add__">Add Another</option>
+            </select>
+            <span class="hint">Choose the Special Program assigned to this section.</span>
+          </label>
+          <div id="sAddSpecialProgramFields" style="display:none; background:#F7F4E9; border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:-4px;">
+            <label class="field">New Special Program option
+              <input type="text" id="sNewSpecialProgram" placeholder="Enter program name">
+            </label>
+            <div class="err-text" id="sSpecialProgramErr"></div>
+            <button type="button" class="btn gold" id="sAddSpecialProgramBtn" style="margin-top:4px;">Add Program</button>
+          </div>
+          <label class="field">Section Adviser
+            <select id="sAdviser">
+              <option value="">— Unassigned —</option>
+              ${TEACHERS.map(t=>`<option value="${esc(t.id)}" ${isEdit&&existing.adviserId===t.id?'selected':''}>${esc(t.name)}${t.role?' — '+esc(t.role):''}</option>`).join("")}
+              ${isEdit&&existing.adviserId&&!TEACHERS.some(t=>t.id===existing.adviserId)?`<option value="${esc(existing.adviserId)}" selected>Unavailable Teacher</option>`:''}
+            </select>
+            <span class="hint">Select a teacher from Teachers &amp; Loads. The section displays the teacher’s current name.</span>
           </label>
           <label class="field" id="sShiftField" style="display:none;">Class Shift (Grade 11/12 only)
             <select id="sClassShift">${CLASS_SHIFTS.map(cs=>`<option value="${cs}" ${(isEdit?(existing.classShift||'None'):'None')===cs?'selected':''}>${cs==="None"?"None":cs+" Class"}</option>`).join("")}</select>
@@ -3491,6 +3844,42 @@ function openSectionForm(existingId){
   syncGradeDependentFields();
   const roomSelect = document.getElementById("sRoom");
   const newRoomFields = document.getElementById("sRoomNewFields");
+  const sectionTypeSelect = document.getElementById("sSectionType");
+  const specialProgramField = document.getElementById("sSpecialProgramField");
+  const specialProgramSelect = document.getElementById("sSpecialProgram");
+  const addSpecialProgramFields = document.getElementById("sAddSpecialProgramFields");
+  let previousSpecialProgram = specialProgramSelect.value;
+  sectionTypeSelect.addEventListener("change", ()=>{
+    specialProgramField.style.display = sectionTypeSelect.value==="Special Program" ? "flex" : "none";
+  });
+  specialProgramSelect.addEventListener("change", ()=>{
+    if(specialProgramSelect.value==="__add__"){
+      specialProgramSelect.value = previousSpecialProgram;
+      addSpecialProgramFields.style.display = "block";
+      document.getElementById("sNewSpecialProgram").focus();
+    } else {
+      previousSpecialProgram = specialProgramSelect.value;
+      addSpecialProgramFields.style.display = "none";
+    }
+  });
+  document.getElementById("sAddSpecialProgramBtn").onclick = async ()=>{
+    const name = document.getElementById("sNewSpecialProgram").value.trim();
+    const err = document.getElementById("sSpecialProgramErr");
+    if(!name){ err.textContent = "Please enter a Special Program name."; return; }
+    const duplicate = SECTION_SPECIAL_PROGRAMS.find(p=>p.toLowerCase()===name.toLowerCase());
+    if(duplicate){ err.textContent = `"${duplicate}" is already available.`; return; }
+    SECTION_SPECIAL_PROGRAMS.push(name);
+    await saveData();
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    specialProgramSelect.insertBefore(option, specialProgramSelect.querySelector('option[value="__add__"]'));
+    specialProgramSelect.value = name;
+    previousSpecialProgram = name;
+    document.getElementById("sNewSpecialProgram").value = "";
+    addSpecialProgramFields.style.display = "none";
+    err.textContent = "";
+  };
   let lastRoomValue = roomSelect.value;
   roomSelect.addEventListener("change", ()=>{
     newRoomFields.style.display = roomSelect.value==="__new__" ? "block" : "none";
@@ -3525,25 +3914,34 @@ function openSectionForm(existingId){
     const strand = (grade==="Grade 11"||grade==="Grade 12") && strandRaw ? strandRaw : undefined;
     const isShs = (grade==="Grade 11"||grade==="Grade 12");
     const sectionType = document.getElementById("sSectionType").value || "Regular";
+    const specialProgram = sectionType==="Special Program" ? document.getElementById("sSpecialProgram").value : "";
+    const adviserId = document.getElementById("sAdviser").value;
     const classShift = isShs ? (document.getElementById("sClassShift").value || "None") : "None";
     const roomSel = document.getElementById("sRoom").value;
     if(roomSel==="__new__"){ document.getElementById("nrErr").textContent = "Save the new room first, or choose an existing one."; return; }
     const roomId = roomSel || undefined;
     if(!name){ document.getElementById("sErr").textContent = "Please enter a section name."; return; }
+    if(sectionType==="Special Program" && (!specialProgram || specialProgram==="__add__")){ document.getElementById("sErr").textContent = "Please select a Special Program."; return; }
+    if(adviserId && !TEACHERS.some(t=>t.id===adviserId)){ document.getElementById("sErr").textContent = "Please select an available teacher as the Section Adviser."; return; }
     const dup = SECTIONS.some(s=> s.grade===grade && s.name.toLowerCase()===name.toLowerCase() && (!isEdit || s.id!==existing.id));
     if(dup){ document.getElementById("sErr").textContent = "A section with this name already exists in that grade."; return; }
     let sectionRecord;
     if(isEdit){
+      if(existing.grade!==grade) delete SCHEDULE_GRADE_CONFIG[existing.id];
       existing.grade = grade; existing.name = name;
       if(strand) existing.strand = strand; else delete existing.strand;
       if(roomId) existing.roomId = roomId; else delete existing.roomId;
       existing.sectionType = sectionType; existing.classShift = classShift;
+      if(specialProgram) existing.specialProgram = specialProgram; else delete existing.specialProgram;
+      if(adviserId) existing.adviserId = adviserId; else delete existing.adviserId;
       sectionRecord = existing;
     } else {
       const id = makeId(); // stable UUID — safe to create the same section offline on two devices without ID collisions
       const sec = { id, grade, name, tier:tierOf(grade), subTier:subTierOf(grade), sectionType, classShift, createdBy: currentAdminId() };
       if(strand) sec.strand = strand;
       if(roomId) sec.roomId = roomId;
+      if(specialProgram) sec.specialProgram = specialProgram;
+      if(adviserId) sec.adviserId = adviserId;
       SECTIONS_ALL.push(sec);
       refreshOwnedViews();
       sectionRecord = sec;
@@ -3562,6 +3960,7 @@ function openSectionViewModal(id){
   const s = SECTIONS.find(x=>x.id===id);
   if(!s) return;
   const room = s.roomId ? ROOMS.find(r=>r.id===s.roomId) : null;
+  const adviser = s.adviserId ? teacherById(s.adviserId) : null;
   const subs = subjectsForSection(s);
   const row = (label, value) => `<div class="field-row" style="margin-bottom:8px;"><div style="flex:1;font-size:12px;color:var(--ink-soft);font-weight:700;">${label}</div><div style="flex:2;font-size:13.5px;">${value}</div></div>`;
   document.getElementById("modalRoot").innerHTML = `
@@ -3591,6 +3990,7 @@ function openSectionViewModal(id){
   const s = SECTIONS.find(x=>x.id===id);
   if(!s) return;
   const room = s.roomId ? ROOMS.find(r=>r.id===s.roomId) : null;
+  const adviser = s.adviserId ? teacherById(s.adviserId) : null;
   const subs = subjectsForSection(s);
   const row = (label, value) => `<div class="field-row" style="margin-bottom:8px;"><div style="flex:1;font-size:12px;color:var(--ink-soft);font-weight:700;">${label}</div><div style="flex:2;font-size:13.5px;">${value}</div></div>`;
   document.getElementById("modalRoot").innerHTML = `
@@ -3602,6 +4002,8 @@ function openSectionViewModal(id){
           ${row("Section Name", `<b>${esc(s.name)}</b>`)}
           ${row("Track/Strand", s.strand ? `<span class="tag maroon">${esc(s.strand)}</span>` : '<span class="hint">—</span>')}
           ${row("Section Type", `<span class="tag ${s.sectionType==='Special Program'?'maroon':'gold'}">${esc(s.sectionType||'Regular')}</span>`)}
+          ${s.specialProgram ? row("Special Program", esc(s.specialProgram)) : ''}
+          ${row("Section Adviser", adviser ? esc(adviser.name) : '<span class="hint">Unassigned</span>')}
           ${isSHSGrade(s.grade) ? row("Class Shift", s.classShift && s.classShift!=='None' ? `<span class="tag gold">${esc(s.classShift)} Class</span>` : '<span class="hint">None</span>') : ''}
           ${row("Room / Building", room ? `<b>${esc(room.name)}</b>${room.type?' — '+esc(room.type):''}` : '<span class="hint">Unassigned</span>')}
           ${row("Subjects Assigned", subs.length)}
@@ -3626,6 +4028,7 @@ function deleteSection(id){
   openConfirm(`Delete <b>${s.grade} - ${s.name}</b>? This removes it from the section list and daily timetable.`, async ()=>{
     const idx = SECTIONS_ALL.findIndex(x=>x.id===id);
     if(idx>-1) SECTIONS_ALL.splice(idx,1);
+    delete SCHEDULE_GRADE_CONFIG[id];
     refreshOwnedViews();
     await saveData();
     await persistEntityChange("sections", {id}, "DELETE");
@@ -3890,7 +4293,7 @@ async function clearAllOfTable(key){
       subjectIdCounter = 1;
       await saveData();
       for(const id of ids) await persistEntityChange("subjects", {id}, "DELETE");
-      generateSchedule();
+      await generateSchedule();
       await saveData();
       initSubjectFilters();
       renderAll();
@@ -3986,7 +4389,7 @@ document.getElementById("dbImportFile").addEventListener("change", (e)=>{
 document.getElementById("settingsGoDbBtn").addEventListener("click", ()=> navigateTo("database"));
 
 /* =========================================================
-   SYNC CENTER — cloud connection form, live status cards,
+   SYNC CENTER — live status cards,
    pending-queue count, recent activity, and conflict resolution
    UI for the offline-first data layer defined earlier (Teachers,
    Sections, Subjects). See the big comment near CLOUD_CONFIG for
@@ -3996,18 +4399,6 @@ let CONFLICTS_CACHE = [];
 async function renderSyncCenter(){
   if(!document.getElementById("page-database")) return;
 
-  // Connection + cloud config form (only fill inputs on first render for
-  // this session, so we don't clobber text the admin is mid-typing).
-  const urlInput = document.getElementById("cloudUrlInput");
-  const keyInput = document.getElementById("cloudKeyInput");
-  if(urlInput && !urlInput.dataset.touched){
-    urlInput.value = CLOUD_CONFIG.url || "";
-    keyInput.value = CLOUD_CONFIG.anonKey || "";
-    urlInput.addEventListener("input", ()=> urlInput.dataset.touched = "1");
-    keyInput.addEventListener("input", ()=> urlInput.dataset.touched = "1");
-  }
-  const cfgStatus = document.getElementById("cloudCfgStatus");
-  if(cfgStatus) cfgStatus.textContent = CLOUD_CONFIG.enabled ? "Connected to "+CLOUD_CONFIG.url : "Not connected — running offline-only.";
   const autoToggle = document.getElementById("autoSyncToggle");
   if(autoToggle) autoToggle.checked = AUTO_SYNC_ENABLED;
 
@@ -4024,7 +4415,7 @@ async function renderSyncCenter(){
     const stateLabel = { online:"Connected", offline: CLOUD_CONFIG.enabled?"Offline":"Not Configured", syncing:"Synchronizing…", error:"Sync Error" }[CONNECTION_STATE] || "Offline";
     cards.innerHTML = `
       <div class="card stat"><div class="label">Local Database</div><div class="value" style="font-size:20px;">🟢 Connected</div><div class="sub">IndexedDB — always available offline</div></div>
-      <div class="card stat"><div class="label">Cloud Database</div><div class="value" style="font-size:20px;">${CLOUD_CONFIG.enabled ? (CONNECTION_STATE==="online"?"🟢 Connected":CONNECTION_STATE==="syncing"?"🟡 Connecting":"🔴 Unreachable") : "⚪ Not Configured"}</div><div class="sub">${CLOUD_CONFIG.enabled ? CLOUD_CONFIG.url : "Add a Firebase project below"}</div></div>
+      <div class="card stat"><div class="label">Cloud Database</div><div class="value" style="font-size:20px;">${CLOUD_CONFIG.enabled ? (CONNECTION_STATE==="online"?"🟢 Connected":CONNECTION_STATE==="syncing"?"🟡 Connecting":"🔴 Unreachable") : "⚪ Not Configured"}</div><div class="sub">${CLOUD_CONFIG.enabled ? "Firebase Firestore sync enabled" : "Cloud sync is disabled"}</div></div>
       <div class="card stat"><div class="label">Synchronization</div><div class="value" style="font-size:20px;">${stateLabel}</div><div class="sub">${LAST_SYNC_AT ? "Last sync: "+LAST_SYNC_AT.toLocaleString() : "Not synced yet"}</div></div>
       <div class="card stat"><div class="label">Pending Changes</div><div class="value">${pendingCount}</div><div class="sub">${CONFLICTS_CACHE.length ? CONFLICTS_CACHE.length+" unresolved conflict(s)" : "No conflicts"}</div>${pendingCount>0 ? `<button class="icon-btn danger" style="margin-top:8px;" title="Discard changes waiting to sync" id="clearPendingBtn">🧹 Clear Pending</button>` : ''}</div>
     `;
@@ -4134,6 +4525,9 @@ function bulkDeleteTeachers(){
   const ids = [...TEACHER_SELECTED];
   if(!ids.length) return;
   openConfirm(`Delete ${ids.length} selected teacher${ids.length===1?'':'s'} from the faculty roster? Their generated schedule assignments will be cleared.`, async ()=>{
+    const deletedIds=new Set(ids);
+    const advisedSections=SECTIONS.filter(s=>deletedIds.has(s.adviserId));
+    advisedSections.forEach(s=>delete s.adviserId);
     ids.forEach(id=>{
       const idx = TEACHERS_ALL.findIndex(x=>x.id===id);
       if(idx>-1) TEACHERS_ALL.splice(idx,1);
@@ -4144,6 +4538,7 @@ function bulkDeleteTeachers(){
     TEACHER_SELECTED.clear();
     await saveData();
     for(const id of ids) await persistEntityChange("teachers", {id}, "DELETE");
+    for(const section of advisedSections) await persistEntityChange("sections",section,"UPDATE");
     renderAll();
     showToast(ids.length+" teacher(s) deleted. Regenerate the schedule to reassign their vacated periods.");
   }, "Delete Selected");
@@ -4155,6 +4550,8 @@ function bulkDeleteSections(){
     ids.forEach(id=>{
       const idx = SECTIONS_ALL.findIndex(x=>x.id===id);
       if(idx>-1) SECTIONS_ALL.splice(idx,1);
+      delete SCHEDULE_GRADE_CONFIG[id];
+      Object.keys(SCHEDULE_ASSIGNMENTS).forEach(key=>{if(key.startsWith(id+"|"))delete SCHEDULE_ASSIGNMENTS[key];});
     });
     SECTION_SELECTED.clear();
     refreshOwnedViews();
@@ -4772,7 +5169,7 @@ function renderSubjects(){
       <td>${esc(syLabel)}</td>
       <td>${s.units}</td>
       <td>${s.hoursPerWeek}</td>
-      <td>${scheduleDaysLabel(subjectScheduleDays(s))}</td>
+      <td>${daysPerWeekLabel(s)}</td>
       <td><span class="tag ${s.status==='Active'?'green':'grey'}">${s.status}</span></td>
       <td><div class="row-actions">
         <button class="icon-btn" title="View full details" data-subj-view="${s.id}">👁️ View</button>
@@ -4815,7 +5212,7 @@ function openSubjectViewModal(id){
           ${row("Program", `<span class="tag ${s.program==='Special Program'?'maroon':'gold'}">${esc(s.program||'Regular')}</span>`)}
           ${row("Units", s.units)}
           ${row("Hours/Week", s.hoursPerWeek)}
-          ${row("Schedule Days", scheduleDaysLabel(subjectScheduleDays(s)))}
+          ${row("Days per Week", daysPerWeekLabel(s))}
           ${row("Status", `<span class="tag ${s.status==='Active'?'green':'grey'}">${esc(s.status)}</span>`)}
         </div>
         <div class="modal-foot">
@@ -4844,7 +5241,7 @@ function deleteSubject(id){
 }
 document.getElementById("addSubjectBtn").addEventListener("click", ()=> openSubjectForm());
 document.getElementById("clearAllSubjectsBtn").addEventListener("click", ()=> clearAllOfTable("subjects"));
-function openSubjectForm(existingId, presetDayScope){
+function openSubjectForm(existingId){
   const existing = existingId ? SUBJECTS.find(s=>s.id===existingId) : null;
   const isEdit = !!existing;
   const f = currentSubjectFilter();
@@ -4896,14 +5293,18 @@ function openSubjectForm(existingId, presetDayScope){
             </select>
             <span class="hint">Leave as Auto-detect to let ATLAS guess from the subject name, or explicitly assign it to a Learning Area from Specializations &amp; Learning Areas. A teacher qualifies to teach this subject if their tagged specialization matches this Learning Area.</span>
           </label>
-          <label class="field">Schedule Days
-            <select id="subjDayScope">
-              <option value="mon-thu" ${(existing?subjectScheduleDays(existing):presetDayScope)==='mon-thu'?'selected':''}>Monday to Thursday</option>
-              <option value="mon-fri" ${(!existing&&!presetDayScope)||(existing?subjectScheduleDays(existing):presetDayScope)==='mon-fri'?'selected':''}>Monday to Friday</option>
-              <option value="friday-only" ${(existing?subjectScheduleDays(existing):presetDayScope)==='friday-only'?'selected':''}>Friday Only</option>
-            </select>
-            <span class="hint">"Monday to Thursday" is never scheduled on Friday, even when the Friday Schedule is enabled. "Friday Only" is excluded from the Monday–Thursday rotation and only appears in Friday's schedule.</span>
-          </label>
+          <div class="field-row">
+            <label class="field">Days per Week
+              <input type="number" id="subjDaysPerWeek" min="1" max="${activeDays().length}" step="1" value="${existing?subjectDaysPerWeek(existing):activeDays().length}">
+              <span class="hint">How many active school days this subject should be distributed across; this is separate from Hours/Week.</span>
+            </label>
+            <label class="field">Takes place only on Fridays?
+              <select id="subjFridayOnly">
+                <option value="No" ${!existing||subjectScheduleDays(existing)!=='friday-only'?'selected':''}>No — regular schedule</option>
+                <option value="Yes" ${existing&&subjectScheduleDays(existing)==='friday-only'?'selected':''}>Yes — Fridays only</option>
+              </select>
+            </label>
+          </div>
           <div class="field-row">
             <label class="field">Units
               <input type="number" min="0" step="0.5" id="subjUnits" value="${isEdit?existing.units:1}">
@@ -4930,6 +5331,23 @@ function openSubjectForm(existingId, presetDayScope){
     const g = document.getElementById("subjGrade").value;
     document.getElementById("subjStrandField").style.display = tierOf(g)==="SHS" ? "flex" : "none";
   });
+  const subjFridayOnly = document.getElementById("subjFridayOnly");
+  const subjDaysPerWeek = document.getElementById("subjDaysPerWeek");
+  let regularDaysPerWeek = existing&&subjectScheduleDays(existing)!=="friday-only"
+    ? String(subjectDaysPerWeek(existing))
+    : String(activeDays().length);
+  const syncFridayOnlyDays = ()=>{
+    const fridayOnly = subjFridayOnly.value==="Yes";
+    if(fridayOnly){
+      if(!subjDaysPerWeek.disabled) regularDaysPerWeek=subjDaysPerWeek.value;
+      subjDaysPerWeek.value = "1";
+    } else if(subjDaysPerWeek.disabled){
+      subjDaysPerWeek.value = regularDaysPerWeek;
+    }
+    subjDaysPerWeek.disabled = fridayOnly;
+  };
+  subjFridayOnly.addEventListener("change", syncFridayOnlyDays);
+  syncFridayOnlyDays();
   document.getElementById("subjClose").onclick = closeModal;
   document.getElementById("subjCancel").onclick = closeModal;
   document.getElementById("subjBackdrop").addEventListener("click", e=>{ if(e.target.id==="subjBackdrop") closeModal(); });
@@ -4943,12 +5361,20 @@ function openSubjectForm(existingId, presetDayScope){
     const type = document.getElementById("subjType").value;
     const program = document.getElementById("subjProgram").value || "Regular";
     const learningArea = document.getElementById("subjLearningArea").value || undefined;
-    const scheduleDays = document.getElementById("subjDayScope").value;
-    const fridayOnly = scheduleDays === "friday-only"; // kept in sync for any legacy code path still reading the old boolean
+    const fridayOnly = document.getElementById("subjFridayOnly").value==="Yes";
+    const daysPerWeek = fridayOnly ? 1 : Number(document.getElementById("subjDaysPerWeek").value);
     const units = Number(document.getElementById("subjUnits").value) || 0;
     const hoursPerWeek = Number(document.getElementById("subjHours").value) || 0;
     const status = document.getElementById("subjStatus").value;
     if(!name){ document.getElementById("subjErr").textContent = "Please enter a subject name."; return; }
+    if(!Number.isInteger(daysPerWeek) || daysPerWeek<1 || daysPerWeek>activeDays().length){
+      document.getElementById("subjErr").textContent = `Days per Week must be a whole number from 1 to ${activeDays().length}, based on the configured school week.`;
+      return;
+    }
+    if(fridayOnly && !FRIDAY_ENABLED){
+      document.getElementById("subjErr").textContent = "Enable Friday Schedule in Admin Settings before marking this subject Friday Only.";
+      return;
+    }
     if(subjectDuplicate(schoolYearId, termId, g, name, strand, isEdit?existing.id:null)){
       document.getElementById("subjErr").textContent = `A subject named "${name}" already exists for ${g} – ${termById(termId).name} – S.Y. ${schoolYearById(schoolYearId).label}.`;
       return;
@@ -4956,13 +5382,14 @@ function openSubjectForm(existingId, presetDayScope){
     let subjectRecord;
     if(isEdit){
       if(!code) code = existing.code;
-      Object.assign(existing, { schoolYearId, termId, grade:g, strand, name, code, type, program, units, hoursPerWeek, status, fridayOnly, scheduleDays, learningArea });
+      Object.assign(existing, { schoolYearId, termId, grade:g, strand, name, code, type, program, units, hoursPerWeek, status, fridayOnly, daysPerWeek, learningArea });
+      delete existing.scheduleDays;
       if(!learningArea) delete existing.learningArea;
       subjectRecord = existing;
     } else {
       if(!code) code = makeSubjectCode(name, g);
       if(SUBJECTS.some(s=>s.code===code)){ document.getElementById("subjErr").textContent = "That subject code is already in use — choose another."; return; }
-      subjectRecord = { id: makeId(), schoolYearId, termId, grade:g, strand, name, code, type, program, units, hoursPerWeek, status, fridayOnly, scheduleDays, learningArea };
+      subjectRecord = { id: makeId(), schoolYearId, termId, grade:g, strand, name, code, type, program, units, hoursPerWeek, status, fridayOnly, daysPerWeek, learningArea };
       SUBJECTS.push(subjectRecord);
     }
     closeModal();
@@ -4992,17 +5419,15 @@ function renderSections(){
   const tbody = document.querySelector("#sectionsTable tbody");
   tbody.innerHTML = visible.length ? visible.map(s=>{
     const cfg = GRADE_CONFIG[s.grade];
-    const coordination = s.strand ? s.strand+" Track (Subject Teachers — see Schedule)" : "Subject Teachers (see Schedule)";
     const room = s.roomId ? ROOMS.find(r=>r.id===s.roomId) : null;
+    const adviser = s.adviserId ? teacherById(s.adviserId) : null;
     const roomCell = room ? `<b>${esc(room.name)}</b>${room.type?`<div class="hint">${esc(room.type)}</div>`:""}` : `<span class="hint">Unassigned</span>`;
     return `<tr>
       <td class="check-cell"><input type="checkbox" class="row-check" data-id="${s.id}"></td>
       <td>${s.grade}</td>
-      <td>${s.name}${s.strand?` <span class="tag maroon">${s.strand}</span>`:""}${s.sectionType==='Special Program'?' <span class="tag maroon">Special Program</span>':''}${s.classShift&&s.classShift!=='None'?` <span class="tag gold">${s.classShift} Class</span>`:''}${syncBadgeHtml("sections", s.id)}</td>
-      <td><span class="tag gold">Subject-based</span></td>
-      <td>${coordination}</td>
+      <td>${esc(s.name)}${s.strand?` <span class="tag maroon">${esc(s.strand)}</span>`:""}${s.sectionType==='Special Program'?' <span class="tag maroon">Special Program</span>':''}${s.specialProgram?` <span class="tag gold">${esc(s.specialProgram)}</span>`:''}${s.classShift&&s.classShift!=='None'?` <span class="tag gold">${esc(s.classShift)} Class</span>`:''}${syncBadgeHtml("sections", s.id)}</td>
+      <td>${adviser ? esc(adviser.name) : `<span class="hint">Unassigned</span>`}</td>
       <td>${roomCell}</td>
-      <td>${subjectsForSection(s).length}</td>
       <td>${cfg.periods}</td>
       <td><div class="row-actions">
         <button class="icon-btn" title="View section details" data-view-section="${s.id}">👁️ View</button>
@@ -5010,7 +5435,7 @@ function renderSections(){
         <button class="icon-btn danger" title="Permanently delete" data-delete-section="${s.id}">🗑️ Delete</button>
       </div></td>
     </tr>`;
-  }).join("") : `<tr><td colspan="9" class="empty">No sections for ${SECTION_GRADE_FILTER==="All"?"the school":SECTION_GRADE_FILTER} yet.</td></tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">No sections for ${SECTION_GRADE_FILTER==="All"?"the school":SECTION_GRADE_FILTER} yet.</td></tr>`;
   tbody.querySelectorAll("[data-view-section]").forEach(b=>{ b.onclick = ()=>openSectionViewModal(b.dataset.viewSection); });
   tbody.querySelectorAll("[data-edit-section]").forEach(b=>{ b.onclick = ()=>openSectionForm(b.dataset.editSection); });
   tbody.querySelectorAll("[data-delete-section]").forEach(b=>{ b.onclick = ()=>deleteSection(b.dataset.deleteSection); });
@@ -5070,7 +5495,7 @@ function renderScheduleTable(){
   }
   if(addBtn) addBtn.disabled = false;
   const day = SELECTED_SCHED_DAY;
-  const progBadge = (section.sectionType==="Special Program") ? ' <span class="tag gold">Special Program</span>' : ' <span class="tag">Regular Program</span>';
+  const progBadge = (section.sectionType==="Special Program") ? ` <span class="tag gold">Special Program${section.specialProgram?' — '+esc(section.specialProgram):''}</span>` : ' <span class="tag">Regular Program</span>';
   const shiftBadge = (isSHSGrade(section.grade) && section.classShift && section.classShift!=="None") ? ` <span class="tag blue">${section.classShift} Class</span>` : '';
   document.getElementById("schedTitle").innerHTML = esc(section.grade+" — "+section.name+" — "+DAY_FULL_NAME[day]+" Timetable")+progBadge+shiftBadge;
   const structure = "subject-based (rotating Subject Teachers)"+(section.strand?" — "+section.strand+" Track":"");
@@ -5132,6 +5557,16 @@ function checkScheduleConflicts({sectionId, day, start, end, teacherId, subject,
   // relies on this check firing too).
   if(end<=start){
     problems.push(`Invalid time slot: end time must be after start time (${fmt(start)}–${fmt(end)}) for ${section?section.grade+" - "+section.name:"this section"} on ${DAY_FULL_NAME[day]}.`);
+  }
+  if(section){
+    const cfg = SCHEDULE_GRADE_CONFIG[section.id] || GRADE_CONFIG[section.grade];
+    const begin = isSHSGrade(section.grade) && section.classShift==="PM"
+      ? toMinutes(cfg.shsPmStart || SHS_PM_START || cfg.startTime || ADMIN_START)
+      : toMinutes(cfg.startTime || ADMIN_START);
+    const endLimit = sectionClassEnd(section);
+    if(start<begin || end>endLimit){
+      problems.push(`Class-time conflict: ${section.grade} - ${section.name} is configured for ${fmt(begin)}–${fmt(endLimit)}, but this entry is ${fmt(start)}–${fmt(end)} on ${DAY_FULL_NAME[day]}.`);
+    }
   }
 
   // Breaktime / Lunch conflict — the entry must not overlap this section's
@@ -5359,6 +5794,8 @@ function openScheduleEntryModal(sectionId, day, periodIdx, extraId){
       after: { subject, teacherId, start, end, day:d }
     });
 
+    FINAL_SCHEDULE_VALIDATED_AT = null;
+    FINAL_SCHEDULE_VALIDATED_BY = null;
     close();
     saveData();
     renderAll();
@@ -5390,6 +5827,8 @@ function deleteScheduleEntry(sectionId, day, periodIdx, extraId){
       after: null
     });
 
+    FINAL_SCHEDULE_VALIDATED_AT = null;
+    FINAL_SCHEDULE_VALIDATED_BY = null;
     await saveData();
     renderAll();
     showToast("Schedule entry removed.");
@@ -5779,6 +6218,12 @@ function buildConsolidatedScheduleHTML(forPrint){
 function renderFinalScheduleResults(){
   const f = collectFinalScheduleFilters();
   const warnEl = document.getElementById("fsTermWarning");
+  if(!FINAL_SCHEDULE_VALIDATED_AT){
+    warnEl.style.display = "block";
+    warnEl.textContent = "Final Schedule is not available yet. Generate a schedule in Class Schedule, review it, then click Validate Schedule.";
+    document.getElementById("fsResults").innerHTML = "";
+    return;
+  }
   if(finalScheduleOutOfContext(f)){
     warnEl.style.display = "block";
     warnEl.textContent = "No saved schedule to show for that School Year/Term combination — only the currently active School Year and Term (selected on School Year & Terms) has a generated schedule. Switch to it there first, then come back here.";
@@ -5845,6 +6290,7 @@ function applyPrintOrientation(){
 // Prints the ENTIRE matching weekly schedule as one continuous document —
 // a single table with a repeating header, never separate printouts per day.
 function printAllFinalSchedules(){
+  if(!FINAL_SCHEDULE_VALIDATED_AT){ showToast("Validate the schedule before printing Final Classroom Schedule.", true); return; }
   const f = collectFinalScheduleFilters();
   if(finalScheduleOutOfContext(f)){ showToast("Switch to the current School Year/Term to print its schedule.", true); return; }
   const html = buildConsolidatedScheduleHTML(true);
@@ -5860,6 +6306,7 @@ function printAllFinalSchedules(){
 // active filter (Grade Level, Section, Day, Teacher, Room/Building), using
 // the exact same row data as the on-screen consolidated document.
 function downloadFinalScheduleExcel(){
+  if(!FINAL_SCHEDULE_VALIDATED_AT){ showToast("Validate the schedule before downloading Final Classroom Schedule.", true); return; }
   const f = collectFinalScheduleFilters();
   if(finalScheduleOutOfContext(f)){ showToast("Switch to the current School Year/Term to download its schedule.", true); return; }
   const sy = schoolYearById(CURRENT_SCHOOL_YEAR_ID);
@@ -5910,6 +6357,7 @@ function renderSettings(){
     return `<tr data-grade="${g}">
       <td><b>${g}</b></td>
       <td><input type="time" value="${c.startTime}" data-field="startTime"></td>
+      <td><input type="time" value="${c.endTime}" data-field="endTime"></td>
       <td><input type="number" min="1" max="12" value="${c.periods}" data-field="periods"></td>
       <td><input type="number" min="20" max="90" value="${c.periodLen}" data-field="periodLen"></td>
       <td><input type="number" min="0" max="480" value="${c.amBreakAt}" data-field="amBreakAt"></td>
@@ -5923,14 +6371,31 @@ function renderSettings(){
   renderScheduleSettingsPanel();
 }
 function collectSettingsFromForm(){
+  const errors = [];
+  document.querySelectorAll("#settingsTable tbody tr").forEach(row=>{
+    const start = row.querySelector('[data-field="startTime"]').value;
+    const end = row.querySelector('[data-field="endTime"]').value;
+    if(!start || !end || toMinutes(end)<=toMinutes(start)) errors.push(`${row.dataset.grade}: class end time must be later than class start time.`);
+    row.querySelectorAll('input[type="number"]').forEach(input=>{
+      const value=Number(input.value);
+      if(input.value===""||!Number.isFinite(value)||value<Number(input.min)||value>Number(input.max)){
+        errors.push(`${row.dataset.grade}: ${input.dataset.field} must be between ${input.min} and ${input.max}.`);
+      }
+    });
+  });
+  if(errors.length){
+    showToast(errors.join(" "), true);
+    return false;
+  }
   document.querySelectorAll("#settingsTable tbody tr").forEach(row=>{
     const g = row.dataset.grade;
     const cfg = GRADE_CONFIG[g];
     row.querySelectorAll("input").forEach(inp=>{
-      if(inp.dataset.field==="startTime"){ cfg.startTime = inp.value || cfg.startTime; }
+      if(inp.dataset.field==="startTime" || inp.dataset.field==="endTime"){ cfg[inp.dataset.field] = inp.value || cfg[inp.dataset.field]; }
       else{ cfg[inp.dataset.field] = Number(inp.value)||cfg[inp.dataset.field]; }
     });
   });
+  return true;
 }
 
 // Subject records for the currently-selected School Year + Term — the
@@ -6008,6 +6473,26 @@ document.getElementById("teacherSearch").addEventListener("input", renderTeacher
 document.getElementById("teacherLevelFilter").addEventListener("change", renderTeachers);
 document.getElementById("addTeacherBtn").addEventListener("click", ()=>openTeacherForm());
 document.getElementById("addSectionBtn").addEventListener("click", ()=>openSectionForm());
+document.getElementById("exportTeachersCsvBtn").addEventListener("click", ()=>{
+  exportCsvDataset("teachers",TEACHER_SELECTED);
+});
+document.getElementById("exportSectionsCsvBtn").addEventListener("click", ()=>{
+  exportCsvDataset("sections",SECTION_SELECTED);
+});
+document.getElementById("exportSubjectsCsvBtn").addEventListener("click", ()=>{
+  exportCsvDataset("subjects",SUBJECT_SELECTED);
+});
+document.getElementById("csvTemplateDownloadBtn").addEventListener("click", ()=>{
+  downloadCsvDatasetTemplate(document.getElementById("csvDatasetSelect").value);
+});
+document.getElementById("csvExportDataBtn").addEventListener("click", ()=>{
+  const kind=document.getElementById("csvDatasetSelect").value;
+  const selected=kind==="teachers"?TEACHER_SELECTED:kind==="sections"?SECTION_SELECTED:kind==="subjects"?SUBJECT_SELECTED:null;
+  exportCsvDataset(kind,selected);
+});
+document.getElementById("csvImportDataBtn").addEventListener("click", ()=>{
+  openCsvDatasetImport(document.getElementById("csvDatasetSelect").value);
+});
 
 document.getElementById("saveSchoolName").addEventListener("click", async ()=>{
   const name = document.getElementById("schoolNameInput").value.trim();
@@ -6065,15 +6550,22 @@ document.getElementById("removeLogoBtn").addEventListener("click", ()=>{
 document.getElementById("applyStart").addEventListener("click", async ()=>{
   const base = document.getElementById("adminStart").value;
   if(!base){ showToast("Enter a base start time first.", true); return; }
+  captureCurrentScheduleBellConfigs();
   ADMIN_START = base;
   const baseMin = toMinutes(base);
-  GRADE_ORDER.forEach((g,i)=>{ GRADE_CONFIG[g].startTime = fmt24(baseMin + i*15); });
+  GRADE_ORDER.forEach((g,i)=>{
+    const cfg = GRADE_CONFIG[g];
+    const duration = toMinutes(cfg.endTime)-toMinutes(cfg.startTime);
+    cfg.startTime = fmt24(baseMin + i*15);
+    cfg.endTime = fmt24(toMinutes(cfg.startTime)+duration);
+  });
   await saveData();
   renderAll();
   showToast("Class start times staggered by 15 minutes per grade level from the base time.");
 });
 document.getElementById("saveSettings").addEventListener("click", async ()=>{
-  collectSettingsFromForm();
+  captureCurrentScheduleBellConfigs();
+  if(!collectSettingsFromForm()) return;
   await saveData();
   renderAll();
   showToast("Bell schedule settings saved.");
@@ -6094,7 +6586,7 @@ document.getElementById("resetSettings").addEventListener("click", ()=>{
   openConfirm("Reset the school start time and every grade level's bell schedule back to DepEd defaults? Faculty, sections, and subjects are not affected.", async ()=>{
     GRADE_CONFIG = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
     ADMIN_START = "07:30";
-    generateSchedule();
+    await generateSchedule();
     await saveData();
     renderSettings();
     renderAll();
@@ -6105,6 +6597,11 @@ document.getElementById("factoryResetBtn").addEventListener("click", ()=>{
   openConfirm("Erase every teacher, section, subject, and room you've added and reset to a clean, empty state? This cannot be undone.", async ()=>{
     TEACHERS_ALL = JSON.parse(JSON.stringify(SEED_TEACHERS));
     SECTIONS_ALL = JSON.parse(JSON.stringify(SEED_SECTIONS));
+    SECTION_SPECIAL_PROGRAMS = ["RFS", "ESPS"];
+    SCHEDULE_GRADE_CONFIG = {};
+    SCHEDULE_ASSIGNMENTS = {};
+    SCHEDULE_CONFLICTS = [];
+    SECTION_PERIOD_OVERRIDE = {};
     ROOMS.length = 0; ROOMS.push(...JSON.parse(JSON.stringify(SEED_ROOMS)));
     roomCounter = 1;
     refreshOwnedViews();
@@ -6130,7 +6627,7 @@ document.getElementById("factoryResetBtn").addEventListener("click", ()=>{
     SUBJECTS.length = 0;
     subjectIdCounter = 1;
 
-    generateSchedule();
+    await generateSchedule();
     await saveData();
     renderSettings();
     initSubjectFilters();
@@ -6152,12 +6649,15 @@ document.getElementById("factoryResetBtn").addEventListener("click", ()=>{
       persistence and cloud sync all stay consistent).
    ========================================================= */
 function downloadCsvTemplate(filename, headers, sampleRows){
+  downloadCsvFile(filename, headers, sampleRows||[]);
+}
+function downloadCsvFile(filename, headers, rows){
   const esc = v => {
     v = (v===undefined||v===null) ? "" : String(v);
     return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
   };
   const lines = [headers.map(esc).join(",")];
-  (sampleRows||[]).forEach(row=> lines.push(row.map(esc).join(",")));
+  (rows||[]).forEach(row=> lines.push(headers.map((_,i)=>esc(row[i])).join(",")));
   const blob = new Blob(["\uFEFF"+lines.join("\r\n")], {type:"text/csv;charset=utf-8;"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -6165,7 +6665,277 @@ function downloadCsvTemplate(filename, headers, sampleRows){
   document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 }
-
+const CSV_DATASETS = {
+  sections:{headers:["Record ID","Grade Level","Section Name","Track","Section Type","Special Program","Section Adviser ID","Room ID","Class Shift"], sample:["", "Grade 7","Narra","","Regular","","","","None"]},
+  teachers:{headers:["Record ID","Teacher Name","Role/Position","Employee/Teacher ID","Grade Level","Regular Class Loads","Special Program Loads","Special Program Subject","Class Shift","Employment Status","Specializations"], sample:["","Juan Dela Cruz","JHS Mathematics Teacher","T-001","Grade 7","5","1","RFS","None","Full-time","Math"]},
+  subjects:{headers:["Record ID","Subject Code","Subject Name","Grade Level","Track/Strand","School Year ID","Term ID","Subject Type","Program","Learning Area","Units","Hours/Week","Days per Week","Friday Only","Status"], sample:["","FIL7","Filipino","Grade 7","","SY2","TM1","Core","Regular","Filipino","1","4","4","No","Active"]},
+  rooms:{headers:["Record ID","Room Name","Type","Capacity"], sample:["","Room 204","Classroom","40"]},
+  learningAreas:{headers:["Learning Area","Status"], sample:["Mathematics","Active"]},
+  schedules:{headers:["Schedule ID","Section ID","Day","Period Index","Start Time","End Time","Subject","Teacher ID","Room ID","Entry Type"], sample:["","SECTION_ID","Mon","0","07:00","07:50","Mathematics","TEACHER_ID","ROOM_ID","auto"]},
+  teachingLoads:{headers:["Record ID","Teacher Name","Role/Position","Employee/Teacher ID","Grade Level","Regular Class Loads","Special Program Loads","Special Program Subject","Class Shift","Employment Status","Specializations"], sample:["","Juan Dela Cruz","JHS Mathematics Teacher","T-001","Grade 7","5","1","RFS","None","Full-time","Math"]},
+  gradeLevels:{headers:["Grade Level","Class Start Time","Class End Time","Periods per Day","Period Length (min)","Morning Break Starts (min)","Morning Break Duration (min)","Lunch Starts (min)","Lunch Duration (min)","Afternoon Break Starts (min)","Afternoon Break Duration (min)"], sample:["Grade 7","07:00","16:00","9","50","100","15","265","60","475","15"]}
+};
+function csvDatasetRecords(kind){
+  if(kind==="sections") return SECTIONS.map(s=>[s.id,s.grade,s.name,s.strand||"",s.sectionType||"Regular",s.specialProgram||"",s.adviserId||"",s.roomId||"",s.classShift||"None"]);
+  if(kind==="teachers") return TEACHERS.flatMap(t=>{
+    const grades = GRADE_ORDER.filter(g=>gradeLoadTotal(t.gradeLoads&&t.gradeLoads[g])>0);
+    return grades.map(g=>{
+      const loads = normalizedGradeLoad(t,g);
+      return [t.id,t.name,t.role||"",t.employeeId||"",g,loads.regular,loads.special,teacherSpecialProgramSubject(t,g),teacherShiftFor(t,g),t.status||"Full-time",(t.specializations||[]).join("; ")];
+    });
+  });
+  if(kind==="subjects") return SUBJECTS.map(s=>[s.id,s.code,s.name,s.grade,s.strand||"",s.schoolYearId,s.termId,s.type,s.program||"Regular",s.learningArea||"",s.units,s.hoursPerWeek,subjectDaysPerWeek(s),subjectScheduleDays(s)==="friday-only"?"Yes":"No",s.status]);
+  if(kind==="rooms") return ROOMS.map(r=>[r.id,r.name,r.type||"",r.capacity||""]);
+  if(kind==="learningAreas") return AREA_LIST.concat(ARCHIVED_AREAS.filter(a=>!AREA_LIST.includes(a))).map(name=>[name,AREA_LIST.includes(name)?"Active":"Archived"]);
+  if(kind==="schedules") return SECTIONS.flatMap(section=>activeDays().flatMap(day=>buildTimeline(section,day).filter(b=>b.type==="period").map(b=>[
+    scheduleKey(section.id,day,b.periodIdx),section.id,day,b.periodIdx,fmt(b.start),fmt(b.end),b.subject,b.teacherId||"",section.roomId||"",b.source||"auto"
+  ])));
+  if(kind==="teachingLoads") return csvDatasetRecords("teachers");
+  if(kind==="gradeLevels") return GRADE_ORDER.map(g=>{
+    const c=GRADE_CONFIG[g];
+    return [g,c.startTime,c.endTime,c.periods,c.periodLen,c.amBreakAt,c.amBreakLen,c.lunchAt,c.lunchLen,c.pmBreakAt,c.pmBreakLen];
+  });
+  return [];
+}
+function exportCsvDataset(kind,selectedIds){
+  const dataset=CSV_DATASETS[kind];
+  if(!dataset) return;
+  let rows=csvDatasetRecords(kind);
+  if(selectedIds&&selectedIds.size) rows=rows.filter(row=>selectedIds.has(String(row[0])));
+  downloadCsvFile(`atlas-${kind}.csv`,dataset.headers,rows);
+}
+function downloadCsvDatasetTemplate(kind){
+  const dataset=CSV_DATASETS[kind];
+  if(dataset) downloadCsvTemplate(`atlas-${kind}-template.csv`,dataset.headers,[dataset.sample]);
+}
+function openCsvDatasetImport(kind){
+  if(kind==="teachers" || kind==="teachingLoads"){
+    document.getElementById("importTeachersBtn").click();
+    return;
+  }
+  const seen = new Set();
+  const required = keys=>({label:keys[0],keys});
+  const config = {
+    title:`Import ${CSV_DATASETS[kind].headers[0]} Records from CSV/Excel`,
+    hint:"Upload a completed template. Rows are validated and previewed before changes are saved. Record IDs update matching records; records owned by another administrator cannot be changed.",
+    fileInputId:"csvDatasetImportFile",
+    templateFilename:`atlas-${kind}-template.csv`,
+    templateHeaders:CSV_DATASETS[kind].headers,
+    templateSample:[CSV_DATASETS[kind].sample],
+    previewColumns:CSV_DATASETS[kind].headers,
+    entityLabel:"record(s)",
+    errorRowCells:row=>CSV_DATASETS[kind].headers.map(h=>row[h.toLowerCase()]||""),
+    resetParse:()=>seen.clear()
+  };
+  if(kind==="sections"){
+    config.requiredColumns=[required(["grade level","grade"]),required(["section name","name"])];
+    config.parseRow=row=>{
+      const gradeRaw=String(row["grade level"]||row["grade"]||"").trim();
+      const name=String(row["section name"]||row["name"]||"").trim();
+      const grade=GRADE_ORDER.find(g=>g.toLowerCase()===gradeRaw.toLowerCase());
+      if(!grade) return {ok:false,error:`Invalid Grade Level "${gradeRaw}".`};
+      if(!name) return {ok:false,error:"Missing Section Name."};
+      const id=String(row["record id"]||"").trim();
+      if(id&&seen.has(id)) return {ok:false,error:`Duplicate Record ID "${id}" in this file.`};
+      if(id) seen.add(id);
+      const existing=id?SECTIONS_ALL.find(s=>s.id===id):null;
+      if(id&&!existing) return {ok:false,error:`Section ID "${id}" does not exist; clear Record ID to create a new section.`};
+      if(existing&&existing.createdBy&&existing.createdBy!==currentAdminId()) return {ok:false,error:"This section belongs to another administrator."};
+      const rawType=String(row["section type"]||"Regular").trim();
+      const specialType=["esps","rfs"].includes(rawType.toLowerCase())?rawType.toUpperCase():"";
+      const sectionType=specialType||SECTION_TYPES.find(t=>t.toLowerCase()===rawType.toLowerCase());
+      if(!sectionType) return {ok:false,error:`Invalid Section Type "${rawType}".`};
+      const specialProgram=String(row["special program"]||specialType||"").trim();
+      if(sectionType==="Special Program"&&!specialProgram) return {ok:false,error:"Special Program sections require a Special Program value."};
+      const strand=String(row.track||"").trim();
+      if(strand && !["Grade 11","Grade 12"].includes(grade)) return {ok:false,error:"Track is only valid for Grade 11/12."};
+      if(strand&&!TRACK_LIST.includes(strand)) return {ok:false,error:`Invalid Track "${strand}".`};
+      const roomId=String(row["room id"]||"").trim();
+      if(roomId&&!ROOMS.some(r=>r.id===roomId)) return {ok:false,error:`Room ID "${roomId}" does not exist.`};
+      const adviserId=String(row["section adviser id"]||"").trim();
+      if(adviserId&&!teacherById(adviserId)) return {ok:false,error:`Section Adviser ID "${adviserId}" does not exist in Teachers & Loads.`};
+      const classShift=String(row["class shift"]||"None").trim()||"None";
+      if(!CLASS_SHIFTS.includes(classShift)) return {ok:false,error:`Invalid Class Shift "${classShift}".`};
+      if(SECTIONS_ALL.some(s=>s.id!==id&&s.grade===grade&&s.name.toLowerCase()===name.toLowerCase())) return {ok:false,error:`A section named "${name}" already exists in ${grade}.`};
+      const record={...(existing||{}),id:id||makeId(),grade,name,tier:tierOf(grade),subTier:subTierOf(grade),sectionType:sectionType==="ESPS"||sectionType==="RFS"?"Special Program":sectionType,classShift,createdBy:existing?existing.createdBy:currentAdminId()};
+      if(strand) record.strand=strand; else delete record.strand;
+      if(roomId) record.roomId=roomId; else delete record.roomId;
+      if(adviserId) record.adviserId=adviserId; else delete record.adviserId;
+      if(specialProgram) record.specialProgram=specialProgram; else delete record.specialProgram;
+      return {ok:true,record,display:CSV_DATASETS.sections.headers.map(h=>record[({"Record ID":"id","Grade Level":"grade","Section Name":"name","Track":"strand","Section Type":"sectionType","Special Program":"specialProgram","Section Adviser ID":"adviserId","Room ID":"roomId","Class Shift":"classShift"})[h]]||"")};
+    };
+    config.commit=async records=>{
+      const operations=[];
+      records.forEach(r=>{
+        if(r.specialProgram&&!SECTION_SPECIAL_PROGRAMS.some(p=>p.toLowerCase()===r.specialProgram.toLowerCase())) SECTION_SPECIAL_PROGRAMS.push(r.specialProgram);
+        const old=SECTIONS_ALL.find(s=>s.id===r.id);
+        if(old){Object.assign(old,r);operations.push({record:old,type:"UPDATE"});}
+        else {SECTIONS_ALL.push(r);operations.push({record:r,type:"CREATE"});}
+      });
+      refreshOwnedViews(); await saveData();
+      for(const op of operations) await persistEntityChange("sections",op.record,op.type);
+    };
+  } else if(kind==="subjects"){
+    config.requiredColumns=[required(["subject code","code"]),required(["subject name","name"]),required(["grade level","grade"])];
+    config.parseRow=row=>{
+      const id=String(row["record id"]||"").trim();
+      if(id&&seen.has(id)) return {ok:false,error:`Duplicate Record ID "${id}" in this file.`};
+      if(id) seen.add(id);
+      const existing=id?SUBJECTS.find(s=>s.id===id):null;
+      if(id&&!existing) return {ok:false,error:`Subject ID "${id}" does not exist; clear Record ID to create a new subject.`};
+      const name=String(row["subject name"]||row.name||"").trim();
+      const gradeRaw=String(row["grade level"]||row.grade||"").trim();
+      const grade=GRADE_ORDER.find(g=>g.toLowerCase()===gradeRaw.toLowerCase());
+      if(!name||!grade) return {ok:false,error:"Subject Name and valid Grade Level are required."};
+      const schoolYearId=String(row["school year id"]||existing?.schoolYearId||CURRENT_SCHOOL_YEAR_ID).trim();
+      const termId=String(row["term id"]||existing?.termId||CURRENT_TERM_ID).trim();
+      if(!schoolYearById(schoolYearId)||!termById(termId)) return {ok:false,error:"School Year ID or Term ID is invalid."};
+      const strand=String(row["track/strand"]||"").trim();
+      if(strand&&!["Grade 11","Grade 12"].includes(grade)) return {ok:false,error:"Track/Strand is only valid for Grade 11/12."};
+      if(strand&&!TRACK_LIST.includes(strand)) return {ok:false,error:`Invalid Track/Strand "${strand}".`};
+      const code=String(row["subject code"]||row.code||"").trim()||(existing&&existing.code)||makeSubjectCode(name,grade);
+      const units=Number(row.units??(existing?existing.units:1));
+      const hoursPerWeek=Number(row["hours/week"]??(existing?existing.hoursPerWeek:4));
+      const fridayRaw=String(row["friday only"]??(existing&&subjectScheduleDays(existing)==="friday-only"?"Yes":"No")).trim();
+      if(!["yes","no"].includes(fridayRaw.toLowerCase())) return {ok:false,error:'Friday Only must be "Yes" or "No".'};
+      const fridayOnly=fridayRaw.toLowerCase()==="yes";
+      const daysPerWeek=fridayOnly?1:Number(row["days per week"]??(existing?subjectDaysPerWeek(existing):activeDays().length));
+      if(!Number.isFinite(units)||units<0||!Number.isFinite(hoursPerWeek)||hoursPerWeek<0) return {ok:false,error:"Units and Hours/Week must be non-negative numbers."};
+      if(!Number.isInteger(daysPerWeek)||daysPerWeek<1||daysPerWeek>activeDays().length) return {ok:false,error:`Days per Week must be a whole number from 1 to ${activeDays().length}.`};
+      const duplicate=SUBJECTS.find(s=>s.id!==id&&s.schoolYearId===schoolYearId&&s.termId===termId&&s.grade===grade&&s.name.toLowerCase()===name.toLowerCase()&&(s.strand||"")===strand);
+      if(duplicate) return {ok:false,error:`A matching subject already exists (Record ID ${duplicate.id}); use that ID to update it.`};
+      if(SUBJECTS.some(s=>s.id!==id&&s.code===code)) return {ok:false,error:`Subject Code "${code}" is already in use.`};
+      if(fridayOnly&&!FRIDAY_ENABLED) return {ok:false,error:"Friday Only requires Friday Schedule to be enabled."};
+      const typeRaw=String(row["subject type"]||"Core").trim();
+      const type=SUBJECT_TYPES.find(t=>t.toLowerCase()===typeRaw.toLowerCase());
+      if(!type) return {ok:false,error:`Invalid Subject Type "${typeRaw}".`};
+      const programRaw=String(row.program||"Regular").trim();
+      const program=SUBJECT_PROGRAMS.find(p=>p.toLowerCase()===programRaw.toLowerCase());
+      if(!program) return {ok:false,error:`Invalid Program "${programRaw}".`};
+      const learningArea=String(row["learning area"]||"").trim();
+      if(learningArea&&!AREA_LIST.concat(ARCHIVED_AREAS).includes(learningArea)) return {ok:false,error:`Learning Area "${learningArea}" does not exist.`};
+      const status=String(row.status||"Active").trim();
+      if(!["Active","Inactive"].includes(status)) return {ok:false,error:`Invalid Status "${status}".`};
+      const record={...(existing||{}),id:id||makeId(),code,name,grade,strand,schoolYearId,termId,type,program,learningArea:learningArea||undefined,units,hoursPerWeek,daysPerWeek,fridayOnly,status};
+      return {ok:true,record,display:[record.id,code,name,grade,strand,schoolYearId,termId,type,program,learningArea,units,hoursPerWeek,daysPerWeek,fridayOnly?"Yes":"No",record.status]};
+    };
+    config.commit=async records=>{
+      const ops=[];
+      records.forEach(r=>{const old=SUBJECTS.find(s=>s.id===r.id);if(old){Object.assign(old,r);delete old.scheduleDays;ops.push({r:old,t:"UPDATE"});}else{SUBJECTS.push(r);ops.push({r,t:"CREATE"});}});
+      await saveData(); for(const op of ops) await persistEntityChange("subjects",op.r,op.t);
+    };
+  } else if(kind==="rooms"){
+    config.requiredColumns=[required(["room name","name"])];
+    config.parseRow=row=>{
+      const id=String(row["record id"]||"").trim(), name=String(row["room name"]||row.name||"").trim();
+      if(!name) return {ok:false,error:"Room Name is required."};
+      if(id&&seen.has(id)) return {ok:false,error:`Duplicate Record ID "${id}" in this file.`};
+      if(id) seen.add(id);
+      const existing=id?ROOMS.find(r=>r.id===id):null;
+      if(id&&!existing) return {ok:false,error:`Room ID "${id}" does not exist; clear Record ID to create a new room.`};
+      if(!id&&ROOMS.some(r=>r.name.toLowerCase()===name.toLowerCase())) return {ok:false,error:`Room "${name}" already exists; include its Record ID to update it.`};
+      const capacity=String(row.capacity||"")===""?null:Number(row.capacity);
+      if(capacity!==null&&(!Number.isInteger(capacity)||capacity<1)) return {ok:false,error:"Capacity must be a positive whole number."};
+      const record={...(existing||{}),id:id||"RM"+makeId(),name,type:String(row.type||"").trim(),capacity};
+      return {ok:true,record,display:[record.id,name,record.type,capacity||""]};
+    };
+    config.commit=async records=>{records.forEach(r=>{const i=ROOMS.findIndex(x=>x.id===r.id);if(i>=0)ROOMS[i]=r;else ROOMS.push(r);});await saveData();};
+  } else if(kind==="learningAreas"){
+    config.requiredColumns=[required(["learning area","name"])];
+    config.parseRow=row=>{
+      const name=String(row["learning area"]||row.name||"").trim();
+      if(!name) return {ok:false,error:"Learning Area is required."};
+      if(seen.has(name.toLowerCase())) return {ok:false,error:`Duplicate Learning Area "${name}" in this file.`};
+      seen.add(name.toLowerCase());
+      const status=String(row.status||"Active").trim().toLowerCase();
+      if(!["active","archived"].includes(status)) return {ok:false,error:"Status must be Active or Archived."};
+      return {ok:true,record:{name,status},display:[name,status]};
+    };
+    config.commit=async records=>{
+      records.forEach(r=>{
+        AREA_LIST=AREA_LIST.filter(a=>a.toLowerCase()!==r.name.toLowerCase());
+        ARCHIVED_AREAS=ARCHIVED_AREAS.filter(a=>a.toLowerCase()!==r.name.toLowerCase());
+        if(r.status==="Active") AREA_LIST.push(r.name); else ARCHIVED_AREAS.push(r.name);
+      });
+      await saveData();
+    };
+  } else if(kind==="gradeLevels"){
+    config.requiredColumns=[required(["grade level"]),required(["class start time"]),required(["class end time"])];
+    config.parseRow=row=>{
+      const grade=GRADE_ORDER.find(g=>g.toLowerCase()===String(row["grade level"]||"").trim().toLowerCase());
+      if(!grade) return {ok:false,error:"Invalid Grade Level."};
+      const cfg={};
+      const fields={startTime:"class start time",endTime:"class end time",periods:"periods per day",periodLen:"period length (min)",amBreakAt:"morning break starts (min)",amBreakLen:"morning break duration (min)",lunchAt:"lunch starts (min)",lunchLen:"lunch duration (min)",pmBreakAt:"afternoon break starts (min)",pmBreakLen:"afternoon break duration (min)"};
+      Object.keys(fields).forEach(key=>{cfg[key]=key==="startTime"||key==="endTime"?String(row[fields[key]]||""):Number(row[fields[key]]);});
+      const validTime=value=>/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
+      if(!validTime(cfg.startTime)||!validTime(cfg.endTime)||toMinutes(cfg.endTime)<=toMinutes(cfg.startTime)) return {ok:false,error:"Class times must be valid HH:MM values and end after start."};
+      const ranges={periods:[1,12],periodLen:[20,90],amBreakAt:[0,480],amBreakLen:[5,30],lunchAt:[0,600],lunchLen:[20,120],pmBreakAt:[0,700],pmBreakLen:[5,30]};
+      if(Object.entries(ranges).some(([key,range])=>!Number.isFinite(cfg[key])||cfg[key]<range[0]||cfg[key]>range[1])) return {ok:false,error:"Periods, durations, or break offsets are outside the allowed bell-configuration ranges."};
+      return {ok:true,record:{grade,cfg},display:[grade,...Object.values(cfg)]};
+    };
+    config.commit=async records=>{
+      captureCurrentScheduleBellConfigs();
+      records.forEach(r=>GRADE_CONFIG[r.grade]=r.cfg);
+      await saveData();
+    };
+  } else if(kind==="schedules"){
+    let batchSlots=[];
+    config.resetParse=()=>{seen.clear();batchSlots=[];};
+    config.requiredColumns=[required(["section id"]),required(["day"]),required(["period index"]),required(["subject"]),required(["teacher id"])];
+    config.parseRow=row=>{
+      const sectionId=String(row["section id"]||"").trim(), section=SECTIONS.find(s=>s.id===sectionId);
+      if(!section) return {ok:false,error:`Section ID "${sectionId}" is not available under this administrator.`};
+      if(!assertOwned(section,"import")) return {ok:false,error:"This section belongs to another administrator."};
+      const day=String(row.day||"").trim();
+      if(!SCHOOL_DAYS.includes(day)) return {ok:false,error:`Invalid Day "${day}".`};
+      const periodIdx=Number(row["period index"]);
+      if(!Number.isInteger(periodIdx)||periodIdx<0) return {ok:false,error:"Period Index must be a non-negative whole number."};
+      const id=`${sectionId}|${day}|${periodIdx}`;
+      if(seen.has(id)) return {ok:false,error:`Schedule slot ${id} appears more than once in this file.`};
+      seen.add(id);
+      const raw=buildTimelineRaw(section,day).find(b=>b.type==="period"&&b.periodIdx===periodIdx);
+      if(!raw) return {ok:false,error:`No period ${periodIdx+1} exists for this section on ${day} within the configured class time.`};
+      const start=toMinutes(String(row["start time"]||""));
+      const end=toMinutes(String(row["end time"]||""));
+      if(!Number.isFinite(start)||!Number.isFinite(end)||start!==raw.start||end!==raw.end) return {ok:false,error:"Start Time and End Time must match the configured period times for this section."};
+      const roomId=String(row["room id"]||"").trim();
+      if(roomId&&!ROOMS.some(r=>r.id===roomId)) return {ok:false,error:`Room ID "${roomId}" does not exist.`};
+      if(roomId!==(section.roomId||"")) return {ok:false,error:"Room ID must match the room assigned to this section."};
+      const subject=String(row.subject||"").trim();
+      const shared=subject==="TLE + Research"&&section.grade==="Grade 10"&&section.sectionType==="Special Program"&&section.specialProgram==="ESPS"
+        ? ["TLE","Research"]
+        : [subject];
+      if(!subject||!shared.every(name=>subjectsForSection(section).includes(name))) return {ok:false,error:`Subject "${subject}" is not configured for this section.`};
+      if(!shared.every(name=>programsCompatible(name,section))) return {ok:false,error:`Subject "${subject}" conflicts with the section type.`};
+      const teacherId=String(row["teacher id"]||"").trim();
+      const teacher=teacherId?teacherById(teacherId):null;
+      if(teacherId&&!teacher) return {ok:false,error:`Teacher ID "${teacherId}" is not available under this administrator.`};
+      if(teacher&&(!shared.every(name=>teacherCanTeach(teacher,name))||!canTeacherTakeGradeLoad(teacher,section,subject))) return {ok:false,error:`Teacher "${teacher.name}" is not qualified or load-authorized for "${subject}".`};
+      const conflicts=checkScheduleConflicts({sectionId,day,start,end,teacherId,subject,excludeKey:periodIdx});
+      if(conflicts.length) return {ok:false,error:conflicts[0]};
+      if(teacherId&&batchSlots.some(slot=>slot.teacherId===teacherId&&slot.day===day&&intervalsOverlap(slot.start,slot.end,start,end))) return {ok:false,error:`Teacher "${teacher.name}" is assigned to an overlapping slot elsewhere in this import.`};
+      if(section.roomId&&batchSlots.some(slot=>slot.roomId===section.roomId&&slot.sectionId!==sectionId&&slot.day===day&&intervalsOverlap(slot.start,slot.end,start,end))) return {ok:false,error:"This section's classroom is assigned to an overlapping slot elsewhere in this import."};
+      batchSlots.push({teacherId,sectionId,roomId:section.roomId||"",day,start,end});
+      return {ok:true,record:{sectionId,day,periodIdx,subject,teacherId},display:[id,sectionId,day,periodIdx,fmt(start),fmt(end),subject,teacherId,roomId,String(row["entry type"]||"auto")]};
+    };
+    config.commit=async records=>{
+      records.forEach(r=>{
+        const base=buildTimelineRaw(SECTIONS.find(s=>s.id===r.sectionId),r.day).find(b=>b.type==="period"&&b.periodIdx===r.periodIdx);
+        SECTION_PERIOD_OVERRIDE[r.sectionId]=SECTION_PERIOD_OVERRIDE[r.sectionId]||{};
+        SECTION_PERIOD_OVERRIDE[r.sectionId][r.day]=SECTION_PERIOD_OVERRIDE[r.sectionId][r.day]||{};
+        if(base&&base.subject===r.subject) delete SECTION_PERIOD_OVERRIDE[r.sectionId][r.day][r.periodIdx];
+        else SECTION_PERIOD_OVERRIDE[r.sectionId][r.day][r.periodIdx]=r.subject;
+        const key=scheduleKey(r.sectionId,r.day,r.periodIdx);
+        if(r.teacherId) SCHEDULE_ASSIGNMENTS[key]=r.teacherId; else delete SCHEDULE_ASSIGNMENTS[key];
+      });
+      await saveData();
+    };
+  } else {
+    showToast("This data set is derived from the schedule or teaching-load records and cannot be imported directly. Import its source records instead.",true);
+    return;
+  }
+  openBulkImportModal(config);
+}
 // Reads a File (.csv, .xlsx, .xls) and resolves to an array of row objects
 // keyed by a normalized (lowercased, trimmed) version of the header cells.
 function readSpreadsheetFile(file){
@@ -6265,6 +7035,7 @@ function openBulkImportModal(config){
       document.getElementById("biErr").textContent = "That file doesn't contain any data rows.";
       return;
     }
+    if(config.resetParse) config.resetParse();
     // Structural check: every required column must be present in the file's
     // header row before any row is parsed — a missing required column is
     // reported clearly and the import is not attempted, rather than silently
@@ -6325,16 +7096,17 @@ function openBulkImportModal(config){
 document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
   const wholeNonNegative = v => v!==undefined && v!==null && String(v).trim()!=="" && /^\d+$/.test(String(v).trim());
   const splitList = v => (v||"").toString().split(/[;,]/).map(s=>s.trim()).filter(Boolean);
+  const importedTeacherGrades = new Set();
   openBulkImportModal({
     title: "Import Teacher Loads from Excel/CSV",
     hint: "One row per Teacher + Grade Level. Required columns: Teacher Name, Role/Position, Grade Level, Regular Class Loads, Special Program Loads (whole numbers, 0 or greater — Special Program Loads = 0 is normal and won't produce an error). Special Program Subject is required whenever Special Program Loads is greater than 0 (any new subject name is added to the Special Program Subject list automatically). Optional: Employee/Teacher ID, Employment Status, Specialization. A teacher who teaches more than one grade level should have one row per grade; Total Loads is always calculated as Regular + Special, never a column you fill in.",
     fileInputId: "teacherImportFile",
     templateFilename: "atlas-teacher-loads-template.csv",
-    templateHeaders: ["Teacher Name","Role/Position","Employee/Teacher ID","Grade Level","Regular Class Loads","Special Program Loads","Special Program Subject","Employment Status","Specialization"],
+    templateHeaders: ["Record ID","Teacher Name","Role/Position","Employee/Teacher ID","Grade Level","Regular Class Loads","Special Program Loads","Special Program Subject","Class Shift","Employment Status","Specializations"],
     templateSample: [
-      ["Juan Dela Cruz","JHS Mathematics Teacher","T-2026-014","Grade 7","5","2","ICT","Full-time","Math"],
-      ["Juan Dela Cruz","JHS Mathematics Teacher","T-2026-014","Grade 8","4","2","Research","Full-time","Math"],
-      ["Maria Santos","SHS Science Teacher","T-2026-021","Grade 11","6","0","","Part-time","Science"]
+      ["","Juan Dela Cruz","JHS Mathematics Teacher","T-2026-014","Grade 7","5","2","ICT","None","Full-time","Math"],
+      ["","Juan Dela Cruz","JHS Mathematics Teacher","T-2026-014","Grade 8","4","2","Research","None","Full-time","Math"],
+      ["","Maria Santos","SHS Science Teacher","T-2026-021","Grade 11","6","0","","None","Part-time","Science"]
     ],
     requiredColumns: [
       {label:"Teacher Name", keys:["teacher name","full name","name"]},
@@ -6345,6 +7117,7 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
     ],
     previewColumns: ["Teacher","Grade Level","Regular Loads","Special Program Loads","Special Program Subject","Total"],
     entityLabel: "teacher(s)",
+    resetParse:()=>importedTeacherGrades.clear(),
     errorRowCells: row => [
       row["teacher name"]||row["full name"]||row["name"]||"",
       row["grade level"]||row["grade"]||"",
@@ -6356,6 +7129,7 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
     parseRow(row){
       const name = (row["teacher name"]||row["full name"]||row["name"]||"").toString().trim();
       const role = (row["role/position"]||row["role"]||row["position"]||"").toString().trim();
+      const recordId = (row["record id"]||"").toString().trim();
       const employeeId = (row["employee/teacher id"]||row["employee id"]||row["teacher id"]||"").toString().trim();
       const gradeRaw = (row["grade level"]||row["grade"]||"").toString().trim();
       const regRaw = row["regular class loads"]!==undefined ? row["regular class loads"] : (row["regular load(s)"]!==undefined?row["regular load(s)"]:(row["regular loads"]!==undefined?row["regular loads"]:row["regular"]));
@@ -6367,6 +7141,10 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
       if(!gradeRaw) return {ok:false, error:"Missing Grade Level."};
       const grade = GRADE_ORDER.find(g=>g.toLowerCase()===gradeRaw.toLowerCase());
       if(!grade) return {ok:false, error:`Unrecognized Grade Level "${gradeRaw}". Configured Grade Levels: ${GRADE_ORDER.join(", ")}.`};
+      if(recordId&&!teacherById(recordId)) return {ok:false,error:`Teacher Record ID "${recordId}" is not available under this administrator.`};
+      const importGradeKey=(recordId||employeeId||name.toLowerCase()+"::"+role.toLowerCase())+"::"+grade;
+      if(importedTeacherGrades.has(importGradeKey)) return {ok:false,error:`This teacher already has an imported row for ${grade}.`};
+      importedTeacherGrades.add(importGradeKey);
       if(!wholeNonNegative(regRaw)) return {ok:false, error:`Regular Class Loads must be a whole number, 0 or greater (got "${regRaw===undefined?"":regRaw}").`};
       if(!wholeNonNegative(specRaw)) return {ok:false, error:`Special Program Loads must be a whole number, 0 or greater (got "${specRaw===undefined?"":specRaw}").`};
       const regular = Number(regRaw), special = Number(specRaw);
@@ -6376,9 +7154,11 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
       let status = (row["employment status"]||row["status"]||"Full-time").toString().trim();
       status = /^part-?time$/i.test(status) ? "Part-time" : "Full-time";
       const specializations = splitList(row["specialization"]||row["specializations"]||row["learning area"]);
+      const classShift = String(row["class shift"]||"None").trim()||"None";
+      if(!CLASS_SHIFTS.includes(classShift)) return {ok:false,error:`Invalid Class Shift "${classShift}".`};
       return {
         ok:true,
-        record: { name, role, employeeId, status, specializations, grade, regular, special, specialSubject: special>0?specialSubject:"" },
+        record: { recordId, name, role, employeeId, status, specializations, classShift, grade, regular, special, specialSubject: special>0?specialSubject:"" },
         display: [name+(employeeId?` (${employeeId})`:""), grade, regular, special, special>0?specialSubject:"—", regular+special]
       };
     },
@@ -6390,20 +7170,21 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
     finalizeRecords(rawValid){
       const groups = new Map();
       rawValid.forEach(r=>{
-        const key = r.employeeId ? "id::"+r.employeeId.toLowerCase() : "name::"+r.name.toLowerCase()+"::"+r.role.toLowerCase();
-        if(!groups.has(key)) groups.set(key, { name:r.name, role:r.role, employeeId:r.employeeId, status:r.status, specializations:r.specializations, gradeLoads:{} });
+        const key = r.recordId ? "record::"+r.recordId : r.employeeId ? "employee::"+r.employeeId.toLowerCase() : "name::"+r.name.toLowerCase()+"::"+r.role.toLowerCase();
+        if(!groups.has(key)) groups.set(key, { recordId:r.recordId, name:r.name, role:r.role, employeeId:r.employeeId, status:r.status, specializations:r.specializations, gradeLoads:{}, gradeShifts:{} });
         groups.get(key).gradeLoads[r.grade] = { regular:r.regular, special:r.special, specialSubject:r.specialSubject }; // last row for a repeated grade wins
+        groups.get(key).gradeShifts[r.grade] = r.classShift;
       });
       const entries = [];
       groups.forEach(g=>{
-        const existing = g.employeeId
+        const existing = g.recordId ? teacherById(g.recordId) : g.employeeId
           ? TEACHERS.find(t=> (t.employeeId||"").toLowerCase()===g.employeeId.toLowerCase())
           : TEACHERS.find(t=> t.name.toLowerCase()===g.name.toLowerCase() && t.role.toLowerCase()===g.role.toLowerCase());
         if(existing){
-          entries.push({ isNew:false, existingId: existing.id, mergedGradeLoads: g.gradeLoads });
+          entries.push({ isNew:false, existingId: existing.id, updates:g, mergedGradeLoads: g.gradeLoads });
         } else {
           const tiers = GRADE_ORDER.filter(gr=>gradeLoadTotal(g.gradeLoads[gr])>0);
-          entries.push({ isNew:true, record: { id: makeId(), name:g.name, role:g.role, employeeId:g.employeeId||"", tiers, gradeLoads:g.gradeLoads, gradeShifts:{}, status:g.status, specializations:g.specializations, subjectsCanTeach:[], maxTeachingHours:null, createdBy: currentAdminId() } });
+          entries.push({ isNew:true, record: { id: makeId(), name:g.name, role:g.role, employeeId:g.employeeId||"", tiers, gradeLoads:g.gradeLoads, gradeShifts:g.gradeShifts, status:g.status, specializations:g.specializations, subjectsCanTeach:[], maxTeachingHours:null, createdBy: currentAdminId() } });
         }
       });
       return entries;
@@ -6419,8 +7200,12 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
         if(e.isNew){ TEACHERS_ALL.push(e.record); return; }
         const t = TEACHERS_ALL.find(x=>x.id===e.existingId);
         if(!t) return;
+        t.name=e.updates.name; t.role=e.updates.role; t.employeeId=e.updates.employeeId;
+        t.status=e.updates.status; t.specializations=e.updates.specializations;
         t.gradeLoads = t.gradeLoads || {};
         Object.assign(t.gradeLoads, e.mergedGradeLoads);
+        t.gradeShifts = t.gradeShifts || {};
+        Object.assign(t.gradeShifts,e.updates.gradeShifts);
         t.tiers = GRADE_ORDER.filter(g=>gradeLoadTotal(t.gradeLoads[g])>0);
       });
       refreshOwnedViews();
@@ -6434,115 +7219,10 @@ document.getElementById("importTeachersBtn").addEventListener("click", ()=>{
 });
 
 /* ---- Sections bulk import ---- */
-document.getElementById("importSectionsBtn").addEventListener("click", ()=>{
-  openBulkImportModal({
-    title: "Import Sections from Excel/CSV",
-    hint: "Upload a spreadsheet with one row per section. Required columns: Grade Level, Section Name. Optional: Track (Sr. High only — TechPro, ACADS, or Both), Room/Building (must match an existing room name exactly, or leave blank).",
-    fileInputId: "sectionImportFile",
-    templateFilename: "atlas-sections-template.csv",
-    templateHeaders: ["Grade Level","Section Name","Track","Room/Building"],
-    templateSample: [
-      ["Grade 7","Narra","",""],
-      ["Grade 11","STEM-A","TechPro","Room 204"]
-    ],
-    previewColumns: ["Grade Level","Section Name","Track","Room/Building"],
-    entityLabel: "section(s)",
-    errorRowCells: row => [row["grade level"]||"", row["section name"]||row["section"]||"", row["track"]||"", row["room/building"]||row["room"]||""],
-    parseRow(row){
-      const gradeRaw = (row["grade level"]||row["grade"]||"").toString().trim();
-      const name = (row["section name"]||row["section"]||"").toString().trim();
-      const grade = GRADE_ORDER.find(g=>g.toLowerCase()===gradeRaw.toLowerCase());
-      if(!gradeRaw) return {ok:false, error:"Missing Grade Level."};
-      if(!grade) return {ok:false, error:`Unrecognized grade level "${gradeRaw}". Use values like "Grade 7".`};
-      if(!name) return {ok:false, error:"Missing Section Name."};
-      const isShs = grade==="Grade 11"||grade==="Grade 12";
-      let strand = (row["track"]||row["track/strand"]||"").toString().trim();
-      if(strand && !isShs) strand = "";
-      if(strand && !TRACK_LIST.some(t=>t.toLowerCase()===strand.toLowerCase())){
-        return {ok:false, error:`Unrecognized track "${strand}". Use TechPro, ACADS, or Both.`};
-      }
-      strand = strand ? TRACK_LIST.find(t=>t.toLowerCase()===strand.toLowerCase()) : "";
-      const roomName = (row["room/building"]||row["room"]||"").toString().trim();
-      let roomId = "";
-      if(roomName){
-        const room = ROOMS.find(r=>r.name.toLowerCase()===roomName.toLowerCase());
-        if(!room) return {ok:false, error:`Room "${roomName}" was not found. Add it first on the Sections page, or leave this blank.`};
-        roomId = room.id;
-      }
-      if(SECTIONS.some(s=>s.grade===grade && s.name.toLowerCase()===name.toLowerCase())){
-        return {ok:false, error:`A section named "${name}" already exists in ${grade}.`};
-      }
-      const sec = { id: makeId(), grade, name, tier:tierOf(grade), subTier:subTierOf(grade), createdBy: currentAdminId() };
-      if(strand) sec.strand = strand;
-      if(roomId) sec.roomId = roomId;
-      return { ok:true, record: sec, display:[grade, name, strand||"—", roomName||"—"] };
-    },
-    async commit(records){
-      records.forEach(r=> SECTIONS_ALL.push(r));
-      refreshOwnedViews();
-      await saveData();
-      for(const r of records) await persistEntityChange("sections", r, "CREATE");
-    }
-  });
-});
+document.getElementById("importSectionsBtn").addEventListener("click", ()=>openCsvDatasetImport("sections"));
 
 /* ---- Subjects bulk import ---- */
-document.getElementById("importSubjectsBtn").addEventListener("click", ()=>{
-  const f = currentSubjectFilter();
-  openBulkImportModal({
-    title: "Import Subjects from Excel/CSV",
-    hint: `Upload a spreadsheet with one row per subject. Required columns: Subject Name, Grade Level. Optional: Track/Strand (Sr. High only), Term, School Year, Units, Hours/Week, Subject Type (Core, Specialized, or Elective), Friday Only (Yes/No — excludes the subject from the Mon–Thu rotation so it only appears in Friday's schedule). Rows that leave Term/School Year blank use the currently selected filter (${(termById(f.term)||{}).name||"current term"} — S.Y. ${(schoolYearById(f.sy)||{}).label||"current"}).`,
-    fileInputId: "subjectImportFile",
-    templateFilename: "atlas-subjects-template.csv",
-    templateHeaders: ["Subject Name","Grade Level","Track/Strand","Term","School Year","Units","Hours/Week","Subject Type","Friday Only"],
-    templateSample: [
-      ["Mathematics","Grade 7","","","","1","4","Core","No"],
-      ["Research 1","Grade 11","TechPro","","","1","2","Specialized","No"]
-    ],
-    previewColumns: ["Subject Name","Grade Level","Track/Strand","Term","School Year","Units","Hrs/Wk","Type","Friday Only"],
-    entityLabel: "subject(s)",
-    errorRowCells: row => [row["subject name"]||row["name"]||"", row["grade level"]||"", row["track/strand"]||row["track"]||"", row["term"]||"", row["school year"]||"", row["units"]||"", row["hours/week"]||"", row["subject type"]||row["type"]||"", row["friday only"]||""],
-    parseRow(row){
-      const name = (row["subject name"]||row["name"]||row["subject"]||"").toString().trim();
-      const gradeRaw = (row["grade level"]||row["grade"]||"").toString().trim();
-      const grade = GRADE_ORDER.find(g=>g.toLowerCase()===gradeRaw.toLowerCase());
-      if(!name) return {ok:false, error:"Missing Subject Name."};
-      if(!gradeRaw) return {ok:false, error:"Missing Grade Level."};
-      if(!grade) return {ok:false, error:`Unrecognized grade level "${gradeRaw}". Use values like "Grade 7".`};
-      const isShs = grade==="Grade 11"||grade==="Grade 12";
-      let strand = (row["track/strand"]||row["track"]||"").toString().trim();
-      if(strand && !isShs) strand = "";
-      if(strand && !TRACK_LIST.some(t=>t.toLowerCase()===strand.toLowerCase())){
-        return {ok:false, error:`Unrecognized track "${strand}". Use TechPro, ACADS, or Both.`};
-      }
-      strand = strand ? TRACK_LIST.find(t=>t.toLowerCase()===strand.toLowerCase()) : "";
-      const termRaw = (row["term"]||"").toString().trim();
-      const term = termRaw ? TERMS.find(t=>t.name.toLowerCase()===termRaw.toLowerCase()) : termById(f.term);
-      if(termRaw && !term) return {ok:false, error:`Unrecognized term "${termRaw}".`};
-      const syRaw = (row["school year"]||"").toString().trim();
-      const sy = syRaw ? SCHOOL_YEARS.find(y=>y.label.toLowerCase()===syRaw.toLowerCase()) : schoolYearById(f.sy);
-      if(syRaw && !sy) return {ok:false, error:`Unrecognized school year "${syRaw}".`};
-      const units = row["units"]!==undefined && row["units"]!=="" ? Number(row["units"]) : 1;
-      const hoursPerWeek = row["hours/week"]!==undefined && row["hours/week"]!=="" ? Number(row["hours/week"]) : 4;
-      if(isNaN(units) || isNaN(hoursPerWeek)) return {ok:false, error:"Units and Hours/Week must be numbers."};
-      let type = (row["subject type"]||row["type"]||"Core").toString().trim();
-      type = SUBJECT_TYPES.find(t=>t.toLowerCase()===type.toLowerCase()) || "Core";
-      const fridayOnlyRaw = (row["friday only"]||"").toString().trim().toLowerCase();
-      const fridayOnly = ["yes","y","true","friday","friday only"].includes(fridayOnlyRaw);
-      if(subjectDuplicate(sy.id, term.id, grade, name, strand)){
-        return {ok:false, error:`A subject named "${name}" already exists for ${grade} – ${term.name} – S.Y. ${sy.label}.`};
-      }
-      const code = makeSubjectCode(name, grade);
-      const record = { id: makeId(), schoolYearId:sy.id, termId:term.id, grade, strand, name, code, type, units, hoursPerWeek, status:"Active", fridayOnly };
-      return { ok:true, record, display:[name, grade, strand||"—", term.name, sy.label, units, hoursPerWeek, type, fridayOnly?"Yes":"No"] };
-    },
-    async commit(records){
-      records.forEach(r=> SUBJECTS.push(r));
-      await saveData();
-      for(const r of records) await persistEntityChange("subjects", r, "CREATE");
-    }
-  });
-});
+document.getElementById("importSubjectsBtn").addEventListener("click", ()=>openCsvDatasetImport("subjects"));
 
 function renderAll(){
   renderTopStart();
@@ -6594,7 +7274,11 @@ function scheduleValidationReport(){
   else status = { level:"error", icon:"❌", label:`${hardProblems.length} Conflict${hardProblems.length===1?'':'s'} Found` };
   return { status, hardProblems, openConflicts };
 }
-document.getElementById("validateScheduleBtn").addEventListener("click", ()=>{
+document.getElementById("validateScheduleBtn").addEventListener("click", async ()=>{
+  if(!SCHEDULE_GENERATED_AT){
+    openConfirm("<b>No Schedule Available</b><br><br>There is no schedule to validate. Please generate a schedule first.", ()=>{}, "Close");
+    return;
+  }
   const { status, hardProblems, openConflicts } = scheduleValidationReport();
   const badgeColor = status.level==="ok" ? "green" : status.level==="warn" ? "gold" : "maroon";
   const hardList = hardProblems.slice(0,6).map(p=>`<li>${esc(p)}</li>`).join("") + (hardProblems.length>6 ? `<li>…and ${hardProblems.length-6} more.</li>` : "");
@@ -6605,7 +7289,17 @@ document.getElementById("validateScheduleBtn").addEventListener("click", ()=>{
     ${openConflicts.length ? `<div style="font-weight:700;margin:8px 0 2px;">Other Open Conflicts (Program / Teacher Shift / AM-PM Shift / Teaching Load)</div><ul style="margin:0;padding-left:18px;text-align:left;">${warnList}</ul>` : ''}
     ${!hardProblems.length && !openConflicts.length ? `<div class="hint">Every teacher, section, room, and AM/PM/Program constraint checks out — this schedule is safe to publish or export.</div>` : ''}
   `;
-  if(status.level==="ok"){ showToast("Schedule validated — no teacher, section, room, program, or AM/PM shift conflicts found."); return; }
+  if(status.level==="ok"){
+    FINAL_SCHEDULE_VALIDATED_AT = new Date().toISOString();
+    FINAL_SCHEDULE_VALIDATED_BY = currentUserLabel();
+    await saveData();
+    renderAll();
+    navigateTo("finalschedule");
+    showToast("Schedule validated — Final Classroom Schedule is now available.");
+    return;
+  }
+  FINAL_SCHEDULE_VALIDATED_AT = null;
+  FINAL_SCHEDULE_VALIDATED_BY = null;
   openConfirm(body, ()=>{ navigateTo("conflicts"); }, "View Conflicts");
 });
 document.getElementById("genScheduleBtnTeachers").addEventListener("click", runGenerateSchedule);
@@ -6650,7 +7344,7 @@ async function initApp(){
   // owner.
   if(claimLegacyOwnership()) refreshOwnedViews();
   if(!loaded || Object.keys(SCHEDULE_ASSIGNMENTS).length===0){
-    generateSchedule(); // first run (or nothing generated yet): produce an initial conflict-free schedule
+    await generateSchedule(); // first run (or nothing generated yet): produce an initial schedule
   }
   initSubjectFilters();
   await saveData();
