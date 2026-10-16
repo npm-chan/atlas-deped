@@ -3,7 +3,7 @@
 // network connection. Bump CACHE_VERSION whenever index.html/script.js/
 // style.css change so clients pick up the new files instead of serving a
 // stale cached copy forever.
-const CACHE_VERSION = "atlas-v4";
+const CACHE_VERSION = "atlas-v5";
 const APP_SHELL = [
   "./",
   "./index.html",
